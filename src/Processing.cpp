@@ -11,6 +11,8 @@
 #include <array>
 #include <string>
 #include <functional>
+#include <unordered_map>
+#include <random>
 #include <memory>
 
 // stb_image.h must be in the src/ folder for loadImage() to work.
@@ -23,6 +25,37 @@
 // Uncomment + drop stb_image_write.h to enable saveFrame()/save():
 // #define STB_IMAGE_WRITE_IMPLEMENTATION
 // #include "stb_image_write.h"
+
+// ── Manual glu replacements (no GLU header needed) ───────────────────────────
+static void _gluPerspective(double fovY_deg, double aspect, double zNear, double zFar) {
+    // Identical to gluPerspective -- sets up a perspective projection matrix
+    double f = 1.0 / std::tan(fovY_deg * M_PI / 360.0);
+    double m[16] = {0};
+    m[0]  = f / aspect;
+    m[5]  = f;
+    m[10] = (zFar + zNear) / (zNear - zFar);
+    m[11] = -1.0;
+    m[14] = (2.0 * zFar * zNear) / (zNear - zFar);
+    glMultMatrixd(m);
+}
+static void _gluLookAt(double ex,double ey,double ez,
+                       double cx,double cy,double cz,
+                       double ux,double uy,double uz) {
+    // Identical to gluLookAt
+    double fx=cx-ex, fy=cy-ey, fz=cz-ez;
+    double len=std::sqrt(fx*fx+fy*fy+fz*fz); fx/=len;fy/=len;fz/=len;
+    double rx=fy*uz-fz*uy, ry=fz*ux-fx*uz, rz=fx*uy-fy*ux;
+    len=std::sqrt(rx*rx+ry*ry+rz*rz); rx/=len;ry/=len;rz/=len;
+    double upx=ry*fz-rz*fy, upy=rz*fx-rx*fz, upz=rx*fy-ry*fx;
+    double m[16]={
+        rx,  upx, -fx, 0,
+        ry,  upy, -fy, 0,
+        rz,  upz, -fz, 0,
+        0,   0,   0,   1
+    };
+    glMultMatrixd(m);
+    glTranslated(-ex,-ey,-ez);
+}
 
 // stb_truetype -- drop stb_truetype.h next to this file for TTF font rendering.
 // default.ttf in the project root is loaded automatically as the default font.
@@ -56,7 +89,7 @@ bool  _keyPressed=false;
 int   keyCode=0;
 char  key=0;
 
-int   frameCount=0;
+int   frameCount=1;
 float currentFrameRate=60.0f;
 bool  looping=true;
 static bool   redrawOnce=false;
@@ -70,6 +103,9 @@ bool  doFill=true,doStroke=true,smoothing=true;
 int   currentRectMode=CORNER,currentEllipseMode=CENTER,currentImageMode=CORNER;
 float tintR=1,tintG=1,tintB=1,tintA=1;
 bool  doTint=false;
+static float pendingSpecR=0,pendingSpecG=0,pendingSpecB=0; // set by lightSpecular()
+static float lightConcentration[8] = {0,0,0,0,0,0,0,0}; // spotLight concentration
+static float lightCutoffCos[8]     = {-1,-1,-1,-1,-1,-1,-1,-1}; // cos(cutoff), -1=directional/point
 int   colorModeVal=RGB;
 float colorMaxH=255.0f,colorMaxS=255.0f,colorMaxB=255.0f,colorMaxA=255.0f;
 
@@ -96,7 +132,7 @@ void (*_staticSketchSetup)() = nullptr; // set by static sketches for i3 redraw
 
 static GLFWwindow* gWindow=nullptr;
 static bool is3DMode=false;
-static int   sphereRes=24;
+static int   sphereRes=48;
 static int   curveDetailVal=20;
 static float curveTightnessVal=0.0f;
 static int   bezierDetailVal=60;
@@ -125,62 +161,96 @@ struct Style {
 static std::vector<Style> styleStack;
 
 // =============================================================================
-// NOISE (Perlin)
+// NOISE - exact Java Processing implementation (PApplet.java)
+// Uses a 4096-entry float lookup table with cosine interpolation.
+// This matches Processing Java's noise() output exactly.
 // =============================================================================
 
-static int   noiseOctaves=4;
-static float noiseFalloff=0.5f;
-static int   noisePerm[512];
+static const int PERLIN_YWRAPB = 4;
+static const int PERLIN_YWRAP  = 1 << PERLIN_YWRAPB;  // 16
+static const int PERLIN_ZWRAPB = 8;
+static const int PERLIN_ZWRAP  = 1 << PERLIN_ZWRAPB;  // 256
+static const int PERLIN_SIZE   = 4095;
 
-static void buildNoisePerm(int seed){
-    srand(seed);
-    for (int i = 0; i < 256; i++) noisePerm[i] = i;
-    for (int i = 255; i > 0; i--) {
-        int j = rand() % (i + 1);
-        std::swap(noisePerm[i], noisePerm[j]);
-    }
-    for (int i = 0; i < 256; i++) noisePerm[256 + i] = noisePerm[i];
-}
-void noiseSeed(int s){buildNoisePerm(s);}
-void noiseDetail(int o,float f){noiseOctaves=o;noiseFalloff=f;}
+static int   noiseOctaves  = 4;
+static float noiseFalloff  = 0.5f;
+static float perlinTable[PERLIN_SIZE + 1];
+static bool  perlinInit    = false;
 
-static float fade(float t){return t*t*t*(t*(t*6-15)+10);}
-static float nlerp(float a,float b,float t){return a+t*(b-a);}
-static float grad(int h,float x,float y,float z){
-    int hh=h&15;float u=hh<8?x:y,v=hh<4?y:hh==12||hh==14?x:z;
-    return((hh&1)?-u:u)+((hh&2)?-v:v);
+static void initPerlin(unsigned int seed) {
+    // Java Processing seeds with a simple LCG and fills with rand values in [0,1)
+    // It uses its own random to not disturb the sketch's random()
+    uint32_t s = seed;
+    auto jrand = [&]() -> float {
+        s = s * 1664525u + 1013904223u; // LCG like Java's Random
+        return (s >> 8) / (float)(1 << 24);
+    };
+    for (int i = 0; i < PERLIN_SIZE + 1; i++)
+        perlinTable[i] = jrand();
+    perlinInit = true;
 }
-static float perlin3(float x,float y,float z){
-    int X=((int)std::floor(x))&255,Y=((int)std::floor(y))&255,Z=((int)std::floor(z))&255;
-    x-=std::floor(x);y-=std::floor(y);z-=std::floor(z);
-    float u=fade(x),v=fade(y),w=fade(z);
-    int A=noisePerm[X]+Y,AA=noisePerm[A]+Z,AB=noisePerm[A+1]+Z;
-    int B=noisePerm[X+1]+Y,BA=noisePerm[B]+Z,BB=noisePerm[B+1]+Z;
-    return nlerp(w,
-        nlerp(v,nlerp(u,grad(noisePerm[AA],x,y,z),grad(noisePerm[BA],x-1,y,z)),
-                nlerp(u,grad(noisePerm[AB],x,y-1,z),grad(noisePerm[BB],x-1,y-1,z))),
-        nlerp(v,nlerp(u,grad(noisePerm[AA+1],x,y,z-1),grad(noisePerm[BA+1],x-1,y,z-1)),
-                nlerp(u,grad(noisePerm[AB+1],x,y-1,z-1),grad(noisePerm[BB+1],x-1,y-1,z-1))));
+
+void noiseSeed(int s) { initPerlin((unsigned int)s); }
+void noiseDetail(int o, float f) { noiseOctaves = o; noiseFalloff = f; }
+
+// Cosine interpolation curve -- Java Processing's noise_fsc()
+static inline float noise_fsc(float i) {
+    return 0.5f * (1.0f - std::cos(i * PI));
 }
-static float noiseOctaved(float x,float y,float z){
-    float result = 0, amp = 0.5f, freq = 1, mx = 0;
-    for (int i = 0; i < noiseOctaves; i++) {
-        result += amp * (perlin3(x * freq, y * freq, z * freq) * 0.5f + 0.5f);
-        mx  += amp;
-        amp *= noiseFalloff;
-        freq *= 2;
+
+float noise(float x, float y, float z) {
+    if (!perlinInit) initPerlin(0);  // default seed 0 like Java
+    if (x < 0) x = -x;
+    if (y < 0) y = -y;
+    if (z < 0) z = -z;
+    int xi = (int)x, yi = (int)y, zi = (int)z;
+    float xf = x - xi, yf = y - yi, zf = z - zi;
+    float r = 0.0f, ampl = 0.5f;
+    for (int oct = 0; oct < noiseOctaves; oct++) {
+        int of = xi + (yi << PERLIN_YWRAPB) + (zi << PERLIN_ZWRAPB);
+        float rxf = noise_fsc(xf), ryf = noise_fsc(yf);
+        float n1 = perlinTable[of & PERLIN_SIZE];
+        n1 += rxf * (perlinTable[(of+1) & PERLIN_SIZE] - n1);
+        float n2 = perlinTable[(of + PERLIN_YWRAP) & PERLIN_SIZE];
+        n2 += rxf * (perlinTable[(of + PERLIN_YWRAP + 1) & PERLIN_SIZE] - n2);
+        n1 += ryf * (n2 - n1);
+        of += PERLIN_ZWRAP;
+        n2 = perlinTable[of & PERLIN_SIZE];
+        n2 += rxf * (perlinTable[(of+1) & PERLIN_SIZE] - n2);
+        float n3 = perlinTable[(of + PERLIN_YWRAP) & PERLIN_SIZE];
+        n3 += rxf * (perlinTable[(of + PERLIN_YWRAP + 1) & PERLIN_SIZE] - n3);
+        n2 += ryf * (n3 - n2);
+        n1 += noise_fsc(zf) * (n2 - n1);
+        r   += n1 * ampl;
+        ampl *= noiseFalloff;
+        // Double frequency each octave
+        xi <<= 1; xf *= 2.0f; if (xf >= 1.0f) { xi++; xf--; }
+        yi <<= 1; yf *= 2.0f; if (yf >= 1.0f) { yi++; yf--; }
+        zi <<= 1; zf *= 2.0f; if (zf >= 1.0f) { zi++; zf--; }
     }
-    return result / mx;
+    return r;
 }
-float noise(float x)             {return noiseOctaved(x,0,0);}
-float noise(float x,float y)     {return noiseOctaved(x,y,0);}
-float noise(float x,float y,float z){return noiseOctaved(x,y,z);}
+float noise(float x)           { return noise(x, 0.0f, 0.0f); }
+float noise(float x, float y)  { return noise(x, y,    0.0f); }
+
+// Seeded random -- Mersenne Twister for reproducibility matching Java Processing
+static std::mt19937 _rng(std::mt19937::default_seed);
+static std::uniform_real_distribution<float> _rngDist(0.0f, 1.0f);
+
+void randomSeed(long s) {
+    _rng.seed(static_cast<uint32_t>(s));
+    _rngDist.reset();
+}
+float random(float lo, float hi) {
+    return lo + _rngDist(_rng) * (hi - lo);
+}
+float random(float hi) { return random(0.f, hi); }
 
 float randomGaussian(){
-    static float spare;static bool has=false;
+    static float spare; static bool has=false;
     if(has){has=false;return spare;}
     float u,v,s;
-    do{u=random(-1,1);v=random(-1,1);s=u*u+v*v;}while(s>=1);
+    do{u=_rngDist(_rng)*2-1;v=_rngDist(_rng)*2-1;s=u*u+v*v;}while(s>=1||s==0);
     s=std::sqrt(-2*std::log(s)/s);spare=v*s;has=true;return u*s;
 }
 
@@ -209,7 +279,18 @@ color makeColor(float a,float b,float c,float d){
     else{r=a/colorMaxH;g=b/colorMaxS;bl=c/colorMaxB;aa=d/colorMaxA;}
     return colorVal((int)(r*255),(int)(g*255),(int)(bl*255),(int)(aa*255));
 }
-color makeColor(float gray,float alpha){return makeColor(gray,gray,gray,alpha);}
+color makeColor(float gray,float alpha){
+    // In HSB mode, a single-value gray maps to brightness only (hue=0, sat=0)
+    // matching Processing Java behavior -- background(v) in HSB gives gray
+    if(colorModeVal==HSB){
+        float br=gray/colorMaxB;
+        br=std::fmax(0.f,std::fmin(1.f,br));
+        int v=(int)(br*255);
+        unsigned int a=std::fmax(0.f,std::fmin(1.f,alpha/colorMaxA))*255;
+        return colorVal(v,v,v,(int)a);
+    }
+    return makeColor(gray,gray,gray,alpha);
+}
 
 // =============================================================================
 // color STRUCT CONSTRUCTORS
@@ -266,8 +347,13 @@ color lerpColor(color c1,color c2,float t){
 // =============================================================================
 
 static void applyFill() {
-    // Fill respects lighting -- glColor4f drives the material via GL_COLOR_MATERIAL
     glColor4f(fillR, fillG, fillB, fillA);
+    if(fillA < 0.999f){
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    } else {
+        glDisable(GL_BLEND);
+    }
 }
 
 // Temporarily suspend lighting so stroke lines/points render with their exact
@@ -278,6 +364,12 @@ static void applyStroke() {
         glDisable(GL_COLOR_MATERIAL);
     }
     glColor4f(strokeR, strokeG, strokeB, strokeA);
+    if(strokeA < 0.999f){
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    } else {
+        glDisable(GL_BLEND);
+    }
 }
 
 // Restore lighting after a stroke draw call.
@@ -289,6 +381,16 @@ static void restoreLighting() {
         // Reapply fill colour so the next lit shape uses the right material
         glColor4f(fillR, fillG, fillB, fillA);
     }
+}
+
+static void _restoreMainCanvas(){
+    // Restore main window viewport and projection after PGraphics endDraw()
+    glViewport(0,0,fbW,fbH);
+    glMatrixMode(GL_PROJECTION);glLoadIdentity();
+    glOrtho(0,logicalW,logicalH,0,-1,1);
+    glMatrixMode(GL_MODELVIEW);glLoadIdentity();
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_LIGHTING);
 }
 
 static void setProjection(int,int){
@@ -435,7 +537,7 @@ void size(int w,int h,int renderer){
         glDisable(GL_CULL_FACE);
         glFrontFace(GL_CW);
         glEnable(GL_NORMALIZE);
-        glClearColor(0,0,0,1); // default black before background() is called
+        glClearColor(0.8f,0.8f,0.8f,1); // Java Processing default grey (204,204,204)
         glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
         applyDefaultCamera();
     }
@@ -524,8 +626,8 @@ bool isAltDown() {
 
 void windowRatio(int w,int h){if(gWindow)glfwSetWindowAspectRatio(gWindow,w,h);}
 void pixelDensity(int d){pixelDensityValue=d;}
-void smooth()  {smoothing=true; glEnable(GL_LINE_SMOOTH);glHint(GL_LINE_SMOOTH_HINT,GL_NICEST);glEnable(GL_MULTISAMPLE);}
-void noSmooth(){smoothing=false;glDisable(GL_LINE_SMOOTH);glDisable(GL_POLYGON_SMOOTH);}
+void smooth()  {smoothing=true; glEnable(GL_LINE_SMOOTH);glHint(GL_LINE_SMOOTH_HINT,GL_NICEST);glEnable(GL_POINT_SMOOTH);glHint(GL_POINT_SMOOTH_HINT,GL_NICEST);glEnable(GL_MULTISAMPLE);}
+void noSmooth(){smoothing=false;glDisable(GL_LINE_SMOOTH);glDisable(GL_POLYGON_SMOOTH);glDisable(GL_POINT_SMOOTH);glDisable(GL_MULTISAMPLE);}
 void hint(int which){
     switch(which){
         case ENABLE_DEPTH_TEST:  glEnable(GL_DEPTH_TEST);  break;
@@ -538,6 +640,14 @@ void hint(int which){
 void cursor()       {if(gWindow)glfwSetInputMode(gWindow,GLFW_CURSOR,GLFW_CURSOR_NORMAL);}
 void cursor(int type){if(!gWindow)return;GLFWcursor* c=glfwCreateStandardCursor(type);if(c)glfwSetCursor(gWindow,c);}
 void noCursor()     {if(gWindow)glfwSetInputMode(gWindow,GLFW_CURSOR,GLFW_CURSOR_HIDDEN);}
+// captureMouse(): locks cursor to window and provides unlimited delta movement.
+// Use releaseMouse() or press ESC to free it.
+void captureMouse() {if(gWindow){glfwSetInputMode(gWindow,GLFW_CURSOR,GLFW_CURSOR_DISABLED);
+    // Enable raw motion if supported (removes OS acceleration)
+    if(glfwRawMouseMotionSupported())
+        glfwSetInputMode(gWindow,GLFW_RAW_MOUSE_MOTION,GLFW_TRUE);}}
+void releaseMouse(){if(gWindow){glfwSetInputMode(gWindow,GLFW_CURSOR,GLFW_CURSOR_NORMAL);
+    glfwSetInputMode(gWindow,GLFW_RAW_MOUSE_MOTION,GLFW_FALSE);}}
 
 // =============================================================================
 // STYLE STACK
@@ -575,18 +685,17 @@ void popMatrix() {glPopMatrix();}
 // BACKGROUND / CLEAR
 // =============================================================================
 
-static float bgR=0,bgG=0,bgB=0,bgA=1; // last background() color
+static float bgR=0.8f,bgG=0.8f,bgB=0.8f,bgA=1; // Java Processing default grey // last background() color
 static void setBg(float r,float g,float b,float a){
     bgR=r;bgG=g;bgB=b;bgA=a;
     glClearColor(r,g,b,a);
     glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
 }
+void background(float gray)           {background(gray, colorMaxA);}
 void background(float gray, float a) {
-    fprintf(stderr,"[bg] gray=%.0f\n",gray); fflush(stderr);
     color c = makeColor(gray, a);
     unsigned int v = c.value;
     setBg((v>>16&0xFF)/255.f, (v>>8&0xFF)/255.f, (v&0xFF)/255.f, (v>>24&0xFF)/255.f);
-    fprintf(stderr,"[bg] done\n"); fflush(stderr);
 }
 void background(float r, float g, float b, float a) {
     color c = makeColor(r, g, b, a);
@@ -618,7 +727,9 @@ void clear(){glClearColor(0,0,0,0);glClear(GL_COLOR_BUFFER_BIT);}
 // =============================================================================
 
 void fill(float gray,float a)              {setFillFromColor(makeColor(gray,a));}
+void fill(float gray)                      {setFillFromColor(makeColor(gray,colorMaxA));}
 void fill(float r,float g,float b,float a) {setFillFromColor(makeColor(r,g,b,a));}
+void fill(float r,float g,float b)           {setFillFromColor(makeColor(r,g,b,colorMaxA));}
 void fill(color c)                         {setFillFromColor(c);}
 void fill(color c, float a) {
     unsigned int v = c.value;
@@ -630,7 +741,9 @@ void fill(color c, float a) {
 }
 void noFill()                              {doFill=false;}
 void stroke(float gray,float a)            {setStrokeFromColor(makeColor(gray,a));}
+void stroke(float gray)                    {setStrokeFromColor(makeColor(gray,colorMaxA));}
 void stroke(float r,float g,float b,float a){setStrokeFromColor(makeColor(r,g,b,a));}
+void stroke(float r,float g,float b)          {setStrokeFromColor(makeColor(r,g,b,colorMaxA));}
 void stroke(color c)                       {setStrokeFromColor(c);}
 void noStroke()                            {doStroke=false;}
 void strokeWeight(float w)                 {strokeW=w;}
@@ -652,18 +765,38 @@ void ellipseMode(int m) {currentEllipseMode=m;}
 // 2D PRIMITIVES
 // =============================================================================
 
+static void flushPoints(){} // no-op, points drawn immediately now
+
 void point(float x, float y) {
     if (!doStroke) return;
     applyStroke();
+    if (!smoothing && strokeW <= 1.0f) {
+        glPointSize(1.0f);
+        glBegin(GL_POINTS); glVertex2f(std::floor(x)+0.5f, std::floor(y)+0.5f); glEnd();
+    } else {
+        glPointSize(strokeW);
+        glBegin(GL_POINTS); glVertex2f(x, y); glEnd();
+    }
+    restoreLighting();
+}
+void point(float x, float y, float z) {
+    if (!doStroke) return;
+    applyStroke();
     glPointSize(strokeW);
-    glBegin(GL_POINTS); glVertex2f(x, y); glEnd();
+    glBegin(GL_POINTS); glVertex3f(x, y, z); glEnd();
     restoreLighting();
 }
 void line(float x1, float y1, float x2, float y2) {
     if (!doStroke) return;
     applyStroke();
     glLineWidth(strokeW);
-    glBegin(GL_LINES); glVertex2f(x1, y1); glVertex2f(x2, y2); glEnd();
+    if (!smoothing) {
+        // Snap to pixel centers for crisp lines
+        auto snap=[](float v){return std::floor(v)+0.5f;};
+        glBegin(GL_LINES); glVertex2f(snap(x1),snap(y1)); glVertex2f(snap(x2),snap(y2)); glEnd();
+    } else {
+        glBegin(GL_LINES); glVertex2f(x1, y1); glVertex2f(x2, y2); glEnd();
+    }
     restoreLighting();
 }
 void line(float x1, float y1, float z1, float x2, float y2, float z2) {
@@ -682,10 +815,22 @@ void arc(float cx,float cy,float w,float h,float s,float e){
     resolveEllipse(cx,cy,rx,ry);
     drawEllipseGeom(cx,cy,rx,ry,s,e);
 }
+void arc(float cx,float cy,float w,float h,float s,float e,int mode){
+    arc(cx,cy,w,h,s,e); // mode (OPEN/CHORD/PIE) -- basic impl ignores mode for now
+}
 void rect(float x,float y,float w,float h){
     resolveRect(x,y,w,h);
     if(doFill){applyFill();glBegin(GL_QUADS);glVertex2f(x,y);glVertex2f(x+w,y);glVertex2f(x+w,y+h);glVertex2f(x,y+h);glEnd();}
-    if(doStroke){applyStroke();glLineWidth(strokeW);glBegin(GL_LINE_LOOP);glVertex2f(x,y);glVertex2f(x+w,y);glVertex2f(x+w,y+h);glVertex2f(x,y+h);glEnd();restoreLighting();}
+    if(doStroke){
+        // Expand stroke by half a pixel on each side so it draws fully outside
+        // the fill on all edges (fixes top/left vs right/bottom asymmetry)
+        float sw=strokeW*0.5f;
+        applyStroke();glLineWidth(strokeW);
+        glBegin(GL_LINE_LOOP);
+        glVertex2f(x-sw,y-sw);glVertex2f(x+w+sw,y-sw);
+        glVertex2f(x+w+sw,y+h+sw);glVertex2f(x-sw,y+h+sw);
+        glEnd();restoreLighting();
+    }
 }
 void rect(float x,float y,float w,float h,float r){
     resolveRect(x,y,w,h);r=min(r,min(w,h)*0.5f);const int sg=8;
@@ -711,6 +856,91 @@ void rotateX(float a){glRotatef(a*180.0f/PI,1,0,0);}
 void rotateY(float a){glRotatef(a*180.0f/PI,0,1,0);}
 void rotateZ(float a){glRotatef(a*180.0f/PI,0,0,1);}
 void sphereDetail(int r){sphereRes=r;}
+
+// =============================================================================
+// PHONG SHADING SHADER
+// =============================================================================
+static GLuint phongProg = 0;
+static int    phongVersion = 0; // increment to force recompile
+
+static GLuint compileShader(GLenum type, const char* code) {
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &code, nullptr);
+    glCompileShader(sh);
+    GLint ok; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) { char b[512]; glGetShaderInfoLog(sh,512,nullptr,b); fprintf(stderr,"[sh] %s\n",b); }
+    return sh;
+}
+static void initPhongShader() {
+    if (phongProg) return;
+    // Phong shader using compatibility profile built-ins.
+    // Works on any system that supports our fixed-function GL pipeline.
+    const char* vs = R"VERT(
+varying vec3 vN;
+varying vec3 vP;
+void main(){
+    // gl_NormalMatrix = inverse-transpose of modelview upper 3x3
+    // With glScalef(1,-1,1) baked in, normals are already correct in eye space
+    vN = gl_NormalMatrix * gl_Normal;
+    vP = vec3(gl_ModelViewMatrix * gl_Vertex);
+    gl_Position = ftransform();
+    gl_FrontColor = gl_Color;
+}
+)VERT";
+    const char* fs = R"FRAG(
+varying vec3 vN;
+varying vec3 vP;
+uniform int uNumLights;
+uniform float uLightConc[8];    // spotlight concentration (full range, not capped)
+uniform float uLightCutCos[8]; // cos(cutoff angle), -1 = not a spotlight
+void main(){
+    vec3 N = normalize(vN);
+    vec3 V = normalize(-vP);
+    vec3 col = gl_Color.rgb * gl_LightModel.ambient.rgb;
+    for(int i=0;i<8;i++){
+        if(i>=uNumLights) break;
+        vec4 lp = gl_LightSource[i].position;
+        bool isDirectional = (lp.w < 0.5);
+        vec3 L = isDirectional ? normalize(lp.xyz) : normalize(lp.xyz - vP);
+
+        // Spotlight attenuation -- Java Processing formula:
+        // spotAtten = pow(dot(L, -spotDir), concentration) if inside cone, else 0
+        float spotAtten = 1.0;
+        if(!isDirectional && uLightCutCos[i] > -0.5){
+            vec3 spotDir = normalize(gl_LightSource[i].spotDirection);
+            float spotCos = dot(L, -spotDir); // cos of angle between L and -spotDir
+            if(spotCos < uLightCutCos[i]){
+                spotAtten = 0.0;
+            } else {
+                // Java Processing: pow(spotCos, concentration)
+                spotAtten = pow(max(spotCos, 0.0), uLightConc[i]);
+            }
+        }
+        if(spotAtten < 0.0001) continue;
+
+        col += gl_Color.rgb * gl_LightSource[i].ambient.rgb;
+        float d = max(dot(N, L), 0.0);
+        col += gl_Color.rgb * gl_LightSource[i].diffuse.rgb * d * spotAtten;
+        // Blinn-Phong specular (matches Java Processing shader)
+        vec3 H = normalize(L + V);
+        float nh = max(dot(N, H), 0.0);
+        float s = pow(nh, gl_FrontMaterial.shininess + 1.0);
+        col += gl_FrontMaterial.specular.rgb * gl_LightSource[i].specular.rgb * s * spotAtten;
+    }
+    gl_FragColor = vec4(col, gl_Color.a);
+}
+)FRAG";
+    GLuint v=compileShader(GL_VERTEX_SHADER,vs);
+    GLuint f=compileShader(GL_FRAGMENT_SHADER,fs);
+    phongProg=glCreateProgram();
+    glAttachShader(phongProg,v); glAttachShader(phongProg,f);
+    glLinkProgram(phongProg);
+    GLint ok; glGetProgramiv(phongProg,GL_LINK_STATUS,&ok);
+    if(!ok){char b[512];glGetProgramInfoLog(phongProg,512,nullptr,b);
+            fprintf(stderr,"[sh link] %s\n",b);phongProg=0;}
+    glDeleteShader(v); glDeleteShader(f);
+}
+
 void box(float s){box(s,s,s);}
 void box(float bw,float bh,float bd){
     float hw=bw/2,hh=bh/2,hd=bd/2;
@@ -747,9 +977,23 @@ void box(float bw,float bh,float bd){
 void sphere(float r){
     int stacks=sphereRes, slices=sphereRes;
     if(doFill){
+        // Use Phong (per-pixel) shading when lighting is on for smooth highlights
+        bool usePhong = lightsEnabled;
+        if (usePhong) {
+            initPhongShader();
+            if (phongProg) {
+                glUseProgram(phongProg);
+                GLint loc = glGetUniformLocation(phongProg, "uNumLights");
+                if (loc >= 0) glUniform1i(loc, lightIndex);
+                GLint locC = glGetUniformLocation(phongProg, "uLightConc");
+                if (locC >= 0) glUniform1fv(locC, 8, lightConcentration);
+                GLint locK = glGetUniformLocation(phongProg, "uLightCutCos");
+                if (locK >= 0) glUniform1fv(locK, 8, lightCutoffCos);
+            } else usePhong = false;
+        }
+        applyFill();
         for(int i=0;i<stacks;i++){
             float a0=PI*i/stacks-HALF_PI, a1=PI*(i+1)/stacks-HALF_PI;
-            applyFill();
             glBegin(GL_QUAD_STRIP);
             for(int j=0;j<=slices;j++){
                 float b=TWO_PI*j/slices;
@@ -760,6 +1004,7 @@ void sphere(float r){
             }
             glEnd();
         }
+        if (usePhong) glUseProgram(0);
     }
     if(doStroke){
         applyStroke(); glLineWidth(strokeW);
@@ -827,6 +1072,18 @@ void vertex(float x, float y, float z) {
     shapeVerts3D.push_back({x, y, z});
     if (z != 0.0f) shape3D = true;
 }
+void vertex(float x, float y, float u, float v) {
+    if (!inShape) return;
+    shapeVerts.push_back({x, y});
+    shapeVerts3D.push_back({x, y, 0.0f});
+    // UV stored for future texture mapping support
+}
+void vertex(float x, float y, float z, float u, float v) {
+    if (!inShape) return;
+    shapeVerts.push_back({x, y});
+    shapeVerts3D.push_back({x, y, z});
+    if (z != 0.0f) shape3D = true;
+}
 void beginContour(){inContour=true;contourVerts.clear();}
 void endContour()  {inContour=false;}
 
@@ -850,7 +1107,7 @@ void endShape(int mode){
             default:            gm=GL_POLYGON;       break;
         }
 
-        if(doFill){
+        if(doFill && shapeKind != POINTS && shapeKind != LINES){
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(1.0f, 1.0f);
             applyFill();
@@ -858,6 +1115,26 @@ void endShape(int mode){
             for(auto& v : shapeVerts3D) glVertex3f(v[0], v[1], v[2]);
             glEnd();
             glDisable(GL_POLYGON_OFFSET_FILL);
+        }
+        // POINTS and LINES use stroke color drawn directly
+        if(shapeKind == POINTS){
+            applyStroke();
+            glPointSize(strokeW);
+            glBegin(GL_POINTS);
+            for(auto& v : shapeVerts3D) glVertex3f(v[0], v[1], v[2]);
+            glEnd();
+            restoreLighting();
+            inShape=false; shape3D=false; shapeVerts.clear(); shapeVerts3D.clear();
+            return;
+        }
+        if(shapeKind == LINES){
+            applyStroke(); glLineWidth(strokeW);
+            glBegin(GL_LINES);
+            for(auto& v : shapeVerts3D) glVertex3f(v[0], v[1], v[2]);
+            glEnd();
+            restoreLighting();
+            inShape=false; shape3D=false; shapeVerts.clear(); shapeVerts3D.clear();
+            return;
         }
         // Draw stroke outlines -- shapeVerts was collected in vertex()
         if(doStroke && !shapeVerts.empty()){
@@ -932,28 +1209,43 @@ void endShape(int mode){
     if(shapeVerts.empty()){inShape=false;return;}
 
     // Default beginShape() / endShape(CLOSE) path.
-    // Draw as GL_TRIANGLES from center to each edge -- no stencil needed.
-    // This is correct for any star or polygon because we explicitly
-    // triangulate: for each edge (v[i], v[i+1]) draw (center, v[i], v[i+1]).
+    // Use stencil buffer to fill arbitrary (including concave) polygons correctly.
+    // This matches Java Processing's polygon fill behavior.
     if(shapeKind==-1 || shapeKind==CLOSE){
         if(doFill && shapeVerts.size()>=3){
-            int n = (int)shapeVerts.size();
-
-            // Use the actual geometric center of the shape
-            float cx=0, cy=0, cz=0;
-            for(auto& v:shapeVerts3D){ cx+=v[0]; cy+=v[1]; cz+=v[2]; }
-            cx/=n; cy/=n; cz/=n;
-
             glDisable(GL_CULL_FACE);
-            applyFill();
-            glBegin(GL_TRIANGLES);
-            for(int i=0;i<n;i++){
-                int j=(i+1)%n;
-                glVertex3f(cx, cy, cz);
-                glVertex3f(shapeVerts3D[i][0], shapeVerts3D[i][1], shapeVerts3D[i][2]);
-                glVertex3f(shapeVerts3D[j][0], shapeVerts3D[j][1], shapeVerts3D[j][2]);
-            }
+
+            // Step 1: Write polygon to stencil buffer using odd-even fill rule
+            glEnable(GL_STENCIL_TEST);
+            glClear(GL_STENCIL_BUFFER_BIT);
+            glStencilFunc(GL_ALWAYS, 0, ~0);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT); // toggle stencil bit
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE); // don't write color
+            glBegin(GL_TRIANGLE_FAN);
+            for(auto& v : shapeVerts3D) glVertex3f(v[0], v[1], v[2]);
             glEnd();
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+            // Step 2: Draw fill color only where stencil != 0
+            glStencilFunc(GL_NOTEQUAL, 0, ~0);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+            applyFill();
+            // Draw a bounding quad covering the shape
+            float minx=shapeVerts3D[0][0], maxx=minx;
+            float miny=shapeVerts3D[0][1], maxy=miny;
+            float minz=shapeVerts3D[0][2], maxz=minz;
+            for(auto& v:shapeVerts3D){
+                minx=std::min(minx,v[0]); maxx=std::max(maxx,v[0]);
+                miny=std::min(miny,v[1]); maxy=std::max(maxy,v[1]);
+                minz=std::min(minz,v[2]); maxz=std::max(maxz,v[2]);
+            }
+            float mz=(minz+maxz)*0.5f;
+            glBegin(GL_QUADS);
+            glVertex3f(minx,miny,mz); glVertex3f(maxx,miny,mz);
+            glVertex3f(maxx,maxy,mz); glVertex3f(minx,maxy,mz);
+            glEnd();
+
+            glDisable(GL_STENCIL_TEST);
         }
         if(doStroke){
             applyStroke(); glLineWidth(strokeW);
@@ -971,14 +1263,15 @@ void bezierVertex(float cx1,float cy1,float cx2,float cy2,float x,float y){
     if(!inShape||shapeVerts.empty())return;
     auto[x0,y0]=shapeVerts.back();const int sg=bezierDetailVal;
     for(int i=1;i<=sg;i++){float t=i/(float)sg,u=1-t;
-        shapeVerts.push_back({u*u*u*x0+3*u*u*t*cx1+3*u*t*t*cx2+t*t*t*x,u*u*u*y0+3*u*u*t*cy1+3*u*t*t*cy2+t*t*t*y});}
+        float bx=u*u*u*x0+3*u*u*t*cx1+3*u*t*t*cx2+t*t*t*x, by=u*u*u*y0+3*u*u*t*cy1+3*u*t*t*cy2+t*t*t*y;
+        shapeVerts.push_back({bx,by}); shapeVerts3D.push_back({bx,by,0.0f});}
 }
 void quadraticVertex(float cx,float cy,float x,float y){
     if(!inShape||shapeVerts.empty())return;
     auto[x0,y0]=shapeVerts.back();const int sg=bezierDetailVal;
-    for(int i=1;i<=sg;i++){float t=i/(float)sg,u=1-t;shapeVerts.push_back({u*u*x0+2*u*t*cx+t*t*x,u*u*y0+2*u*t*cy+t*t*y});}
+    for(int i=1;i<=sg;i++){float t=i/(float)sg,u=1-t;float qx=u*u*x0+2*u*t*cx+t*t*x,qy=u*u*y0+2*u*t*cy+t*t*y;shapeVerts.push_back({qx,qy});shapeVerts3D.push_back({qx,qy,0.0f});}
 }
-void curveVertex(float x,float y){if(inShape)shapeVerts.push_back({x,y});}
+void curveVertex(float x,float y){if(inShape){shapeVerts.push_back({x,y});shapeVerts3D.push_back({x,y,0.0f});}}
 
 void bezier(float x1,float y1,float cx1,float cy1,float cx2,float cy2,float x2,float y2){
     if(!doStroke)return;applyStroke();glLineWidth(strokeW);glBegin(GL_LINE_STRIP);
@@ -1061,8 +1354,8 @@ static void applyDefaultCamera() {
     if(gWindow){int fw=logicalW,fh=logicalH;glfwGetFramebufferSize(gWindow,&fw,&fh);if(fw>0)fbW=fw;if(fh>0)fbH=fh;}
     glViewport(0, 0, fbW, fbH);
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    gluPerspective(60.0, (double)logicalW / logicalH, near_, far_);
-    glScalef(1, -1, 1);
+    glScalef(1, -1, 1);  // Y-flip: must come BEFORE gluPerspective (Java Processing order)
+    _gluPerspective(60.0, (double)logicalW / logicalH, near_, far_);
     applyStandardModelview();
 }
 
@@ -1073,10 +1366,10 @@ void camera(float ex,float ey,float ez,float cx,float cy,float cz,float ux,float
     float eyeZ = ((float)logicalH/2.0f) / std::tan(PI*60.0f/360.0f);
     float near_ = eyeZ/10.0f, far_ = eyeZ*10.0f;
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    gluPerspective(60.0,(double)logicalW/logicalH,near_,far_);
-    glScalef(1,-1,1);
+    glScalef(1,-1,1);  // Y-flip before perspective (Java order)
+    _gluPerspective(60.0,(double)logicalW/logicalH,near_,far_);
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-    gluLookAt(ex,ey,ez,cx,cy,cz,ux,uy,uz);
+    _gluLookAt(ex,ey,ez,cx,cy,cz,ux,uy,uz);
     glFrontFace(GL_CW);
     glDisable(GL_CULL_FACE);
     glEnable(GL_DEPTH_TEST);
@@ -1089,18 +1382,20 @@ void perspective(){
 }
 void perspective(float fov, float aspect, float zNear, float zFar) {
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    gluPerspective(degrees(fov), aspect, zNear, zFar);
-    glScalef(1, -1, 1);   // Y-flip so Processing Y-down coords work
+    glScalef(1,-1,1);  // Y-flip before perspective (Java order)
+    _gluPerspective(degrees(fov), aspect, zNear, zFar);
     applyStandardModelview();
 }
 // Helper shared by ortho() and perspective() -- sets up the standard
 // Processing modelview camera (eye at eyeZ looking at canvas centre,
 // Y-down screen coordinates) and enables depth test.
 static void applyStandardModelview() {
-    // Use logicalW/H so camera matches sketch coordinate space.
+    // Java Processing puts glScalef(1,-1,1) in the PROJECTION matrix.
+    // We replicate this: projection already has the flip (added in applyDefaultCamera),
+    // modelview is standard GL Y-up with gluLookAt.
     float eyeZ = ((float)logicalH / 2.0f) / std::tan(PI * 60.0f / 360.0f);
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-    gluLookAt(logicalW/2.0, logicalH/2.0, eyeZ,
+    _gluLookAt(logicalW/2.0, logicalH/2.0, eyeZ,
               logicalW/2.0, logicalH/2.0, 0,
               0, 1, 0);
     glFrontFace(GL_CW);
@@ -1136,9 +1431,9 @@ void ortho(float l, float r, float b, float t, float n, float f) {
     // ortho(-w/2, w/2, -h/2, h/2) covers that range around the camera target.
     // So translate(w/2, h/2) correctly lands at the center of the screen.
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    glScalef(1, -1, 1);          // Y-flip: Processing Y-down convention
-    glOrtho(l, r, b, t, n, f);  // standard order: left,right,bottom,top,near,far
-    applyStandardModelview();    // same camera as perspective()
+    glScalef(1,-1,1);  // Y-flip before ortho (Java order)
+    glOrtho(l, r, b, t, n, f);
+    applyStandardModelview();
 }
 
 void frustum(float l, float r, float b, float t, float n, float f) {
@@ -1165,51 +1460,47 @@ void printProjection(){float m[16];glGetFloatv(GL_PROJECTION_MATRIX,m);std::cout
 // ---------------------------------------------------------------------------
 
 // Convenience: normalise a 0-255 colour component to 0.0-1.0
-static inline float lc(float v) { return v / 255.0f; }
+static inline float lc(float v) { return v / colorMaxH; } // respects colorMode max
 
 // Apply all common light state and reset the index counter.
 // Call this at the start of a draw() that uses lights.
 void lights() {
+    // Matches Processing Java lights() exactly:
+    //   ambientLight(128, 128, 128)
+    //   directionalLight(128, 128, 128,  0, 0, -1)
+    // Result: shadow faces = 50% brightness, front face = 100%, sides interpolated.
     glEnable(GL_LIGHTING);
-    glEnable(GL_NORMALIZE);          // re-normalise normals after scaling
+    glEnable(GL_NORMALIZE);
     glEnable(GL_COLOR_MATERIAL);
-    // Drive DIFFUSE only from glColor()/fill(). Ambient stays at OpenGL default
-    // (0.2 grey) so shadow faces are dark, matching Processing Java's reference output.
-    glColorMaterial(GL_FRONT_AND_BACK, GL_DIFFUSE);
-
-    // Explicit material ambient: Processing Java uses a dark grey ambient material
-    GLfloat matAmb[] = { 0.2f, 0.2f, 0.2f, 1.0f };
-    glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, matAmb);
+    // GL_COLOR_MATERIAL drives AMBIENT_AND_DIFFUSE from fill color
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
 
     lightsEnabled = true;
     lightIndex    = 0;
 
-    // Scene-wide ambient: matches Processing Java reference (~7.8%, value 20/255)
-    // Java uses a darker ambient than you might expect -- faces in shadow are
-    // quite dark (about 20% of fill colour), not 21%.
-    GLfloat globalAmb[] = { 0.078f, 0.078f, 0.078f, 1.0f }; // 20/255
-    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, globalAmb);
+    // Zero out global ambient -- we set it explicitly via LIGHT0 ambient below
+    GLfloat noGlobalAmb[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, noGlobalAmb);
     glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_FALSE);
-    glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_TRUE);
+    glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_FALSE);
 
-    // Default light: 80% white diffuse, directional from upper-left-front.
-    // w=0 means directional (infinite distance, no attenuation).
-    // Position vector points TOWARD the light source in eye space.
-    GLfloat noAmb[] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    GLfloat dif[]   = { 0.8f, 0.8f, 0.8f, 1.0f };
-    GLfloat noSpc[] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    // Processing Java default light: directional, coming from upper-left-front.
-    // In eye space the "from" direction is normalised (-1, -1, 1) -- pointing
-    // toward upper-left in front of the camera.
-    // w=0 means directional (infinite, no attenuation).
-    GLfloat pos[]   = { -0.577f, -0.577f, 0.577f, 0.0f }; // normalised (-1,-1,1)
+    GLfloat zero[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+    // LIGHT0: ambient component = 128/255 (matches Java ambientLight(128,128,128))
+    // This contributes equally to all faces regardless of normal.
+    GLfloat amb[]  = { 0.502f, 0.502f, 0.502f, 1.0f }; // 128/255
+    // LIGHT0: diffuse component = 128/255 (matches Java directionalLight(128,128,128,...))
+    GLfloat dif[]  = { 0.502f, 0.502f, 0.502f, 1.0f }; // 128/255
+    // Direction (0,0,-1) in Java = light travels toward -Z = toward-light vector (0,0,1)
+    // In eye space with default camera looking down -Z, (0,0,1) points at camera = front-lit
+    GLfloat pos[]  = { 0.0f, 0.0f, 1.0f, 0.0f }; // w=0 = directional
 
     glEnable(GL_LIGHT0);
-    glLightfv(GL_LIGHT0, GL_AMBIENT,  noAmb);
+    glLightfv(GL_LIGHT0, GL_AMBIENT,  amb);
     glLightfv(GL_LIGHT0, GL_DIFFUSE,  dif);
-    glLightfv(GL_LIGHT0, GL_SPECULAR, noSpc);
+    glLightfv(GL_LIGHT0, GL_SPECULAR, zero);
 
-    // Set position in eye space so it stays fixed relative to the camera
+    // Set in eye space so light direction is fixed relative to camera
     glPushMatrix();
     glLoadIdentity();
     glLightfv(GL_LIGHT0, GL_POSITION, pos);
@@ -1255,19 +1546,31 @@ void directionalLight(float r, float g, float b, float nx, float ny, float nz) {
     GLenum lt = GL_LIGHT0 + lightIndex++;
 
     GLfloat col[]  = { lc(r), lc(g), lc(b), 1.0f };
-    GLfloat pos[]  = { -nx, -ny, -nz, 0.0f };  // w=0 = directional, negated
+    // Negate direction and flip Y to compensate for glScalef(1,-1,1) in modelview
+    GLfloat pos[]  = { -nx, ny, -nz, 0.0f };
     GLfloat zero[] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
     glEnable(GL_LIGHTING);
     glEnable(GL_NORMALIZE);
+    glDisable(GL_COLOR_MATERIAL);
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
     glEnable(GL_COLOR_MATERIAL);
-    glColorMaterial(GL_FRONT_AND_BACK, GL_DIFFUSE);
+    // No global ambient for directionalLight alone (matches Java Processing)
+    GLfloat gAmb[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    glLightModelfv(GL_LIGHT_MODEL_AMBIENT, gAmb);
+    lightsEnabled = true;
+    GLfloat spec[] = { pendingSpecR, pendingSpecG, pendingSpecB, 1.0f };
     glEnable(lt);
     glLightfv(lt, GL_AMBIENT,  zero);
     glLightfv(lt, GL_DIFFUSE,  col);
-    glLightfv(lt, GL_SPECULAR, zero);
-    // Direction is in current world space (modelview at call time)
-    glLightfv(lt, GL_POSITION, pos);
+    glLightfv(lt, GL_SPECULAR, spec);
+    // Set in pure eye space (no world transforms) like Java Processing.
+    // toward-light in eye space: negate direction, flip Y for our Y-down convention.
+    glPushMatrix();
+    glLoadIdentity();
+    GLfloat posE[] = { nx, -ny, nz, 0.0f }; // toward-light = -direction, Y flipped
+    glLightfv(lt, GL_POSITION, posE);
+    glPopMatrix();
 }
 
 // Point light: emits in all directions from a world-space position.
@@ -1282,7 +1585,7 @@ void pointLight(float r, float g, float b, float x, float y, float z) {
     glEnable(GL_LIGHTING);
     glEnable(GL_NORMALIZE);
     glEnable(GL_COLOR_MATERIAL);
-    glColorMaterial(GL_FRONT_AND_BACK, GL_DIFFUSE);
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
     glEnable(lt);
     glLightfv(lt, GL_AMBIENT,  zero);
     glLightfv(lt, GL_DIFFUSE,  col);
@@ -1301,30 +1604,47 @@ void spotLight(float r, float g, float b,
                float x,  float y,  float z,
                float nx, float ny, float nz,
                float angle, float conc) {
+    // Java Processing sets spotlight pos/dir through the CURRENT modelview
+    // (which includes LookAt * Scale(1,-1,1)) -- same as world space draw.
+    // We flip Y to compensate for our glScalef(1,-1,1) baked into modelview.
     if (lightIndex >= 8) return;
     GLenum lt = GL_LIGHT0 + lightIndex++;
 
     GLfloat col[]  = { lc(r), lc(g), lc(b), 1.0f };
-    GLfloat pos[]  = { x, y, z, 1.0f };
-    GLfloat dir[]  = { nx, ny, nz };
     GLfloat zero[] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
     glEnable(GL_LIGHTING);
     glEnable(GL_NORMALIZE);
+    glDisable(GL_COLOR_MATERIAL);
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
     glEnable(GL_COLOR_MATERIAL);
-    glColorMaterial(GL_FRONT_AND_BACK, GL_DIFFUSE);
+    lightsEnabled = true;
+
     glEnable(lt);
     glLightfv(lt, GL_AMBIENT,  zero);
     glLightfv(lt, GL_DIFFUSE,  col);
     glLightfv(lt, GL_SPECULAR, zero);
-    glLightfv(lt, GL_SPOT_DIRECTION, dir);
-    glLightf(lt, GL_SPOT_CUTOFF,   angle * 180.0f / PI);
-    glLightf(lt, GL_SPOT_EXPONENT, conc);
+
+    // Store concentration and cutoff cosine for the shader
+    // (GL_SPOT_EXPONENT caps at 128, but Java uses values like 600)
+    int li = lightIndex - 1;
+    lightConcentration[li] = conc;
+    lightCutoffCos[li]     = std::cos(angle); // precompute cos(cutoff)
+
+    // Still set GL_SPOT_CUTOFF so fixed-function fallback works
+    float cutDeg = std::min(angle * 180.0f / PI, 90.0f);
+    glLightf(lt, GL_SPOT_CUTOFF,   cutDeg);
+    glLightf(lt, GL_SPOT_EXPONENT, std::min(conc, 128.0f)); // capped for GL
     glLightf(lt, GL_CONSTANT_ATTENUATION,  1.0f);
     glLightf(lt, GL_LINEAR_ATTENUATION,    0.0f);
     glLightf(lt, GL_QUADRATIC_ATTENUATION, 0.0f);
-    // Position and spot direction transformed by current modelview
-    glLightfv(lt, GL_POSITION, pos);
+
+    // Position: NO Y-flip (modelview Scale already handles it correctly)
+    // Direction: Y-flip ny to compensate for Scale(1,-1,1) in modelview
+    GLfloat posW[] = { x,   y,  z,  1.0f };
+    GLfloat dirW[] = { nx, -ny, nz };
+    glLightfv(lt, GL_POSITION,       posW);
+    glLightfv(lt, GL_SPOT_DIRECTION, dirW);
 }
 
 // Override attenuation on all active lights (call after the light functions)
@@ -1339,9 +1659,12 @@ void lightFalloff(float c, float l, float q) {
 
 // Set specular colour on all active lights
 void lightSpecular(float r, float g, float b) {
+    // Store as pending so subsequent light calls pick it up
+    pendingSpecR = lc(r); pendingSpecG = lc(g); pendingSpecB = lc(b);
+    // Also apply to any already-created lights
     for (int i = 0; i < lightIndex; i++) {
         GLenum  lt  = GL_LIGHT0 + i;
-        GLfloat col[] = { lc(r), lc(g), lc(b), 1.0f };
+        GLfloat col[] = { pendingSpecR, pendingSpecG, pendingSpecB, 1.0f };
         glLightfv(lt, GL_SPECULAR, col);
     }
 }
@@ -1352,11 +1675,11 @@ void normal(float nx, float ny, float nz) { glNormal3f(nx, ny, nz); }
 // MATERIAL
 // =============================================================================
 
-void ambient(float r,float g,float b) {GLfloat c[]={r,g,b,1};glMaterialfv(GL_FRONT_AND_BACK,GL_AMBIENT,c);}
+void ambient(float r,float g,float b) {GLfloat c[]={lc(r),lc(g),lc(b),1};glMaterialfv(GL_FRONT_AND_BACK,GL_AMBIENT,c);}
 void ambient(color c)                 {unsigned int v=c.value;ambient((v>>16&0xFF)/255.f,(v>>8&0xFF)/255.f,(v&0xFF)/255.f);}
-void emissive(float r,float g,float b){GLfloat c[]={r,g,b,1};glMaterialfv(GL_FRONT_AND_BACK,GL_EMISSION,c);}
+void emissive(float r,float g,float b){GLfloat c[]={lc(r),lc(g),lc(b),1};glMaterialfv(GL_FRONT_AND_BACK,GL_EMISSION,c);}
 void emissive(color c)                {unsigned int v=c.value;emissive((v>>16&0xFF)/255.f,(v>>8&0xFF)/255.f,(v&0xFF)/255.f);}
-void specular(float r,float g,float b){GLfloat c[]={r,g,b,1};glMaterialfv(GL_FRONT_AND_BACK,GL_SPECULAR,c);}
+void specular(float r,float g,float b){GLfloat c[]={lc(r),lc(g),lc(b),1};glMaterialfv(GL_FRONT_AND_BACK,GL_SPECULAR,c);}
 void specular(color c)                {unsigned int v=c.value;specular((v>>16&0xFF)/255.f,(v>>8&0xFF)/255.f,(v&0xFF)/255.f);}
 void shininess(float s)               {glMaterialf(GL_FRONT_AND_BACK,GL_SHININESS,s);}
 
@@ -1679,7 +2002,6 @@ float textDescent() {
     return 2.0f * sc;
 }
 
-
 // =============================================================================
 // IMAGE
 // =============================================================================
@@ -1723,20 +2045,37 @@ PImage* loadImage(const std::string& path){
     return new PImage(); // return empty (not null) so -> calls are safe
 }
 
-
 PGraphics* createGraphics(int w,int h){return new PGraphics(w,h);}
 
+// ── PImage::uploadTexture ────────────────────────────────────────────────────
+void PImage::uploadTexture() {
+    if (width <= 0 || height <= 0 || pixels.empty()) return;
+    if ((int)pixels.size() < width * height) return;
+    std::vector<unsigned char> rgba((size_t)width * height * 4);
+    for (int i = 0; i < width*height; i++) {
+        unsigned int p = pixels[i];
+        rgba[i*4+0] = (p>>16)&0xFF;
+        rgba[i*4+1] = (p>>8) &0xFF;
+        rgba[i*4+2] =  p     &0xFF;
+        rgba[i*4+3] = (p>>24)&0xFF;
+    }
+    if (texID == 0) glGenTextures(1, &texID);
+    glBindTexture(GL_TEXTURE_2D, texID);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    glBindTexture(GL_TEXTURE_2D, 0);
+    dirty = false;
+}
+
 static void drawImageRect(PImage& img,float x,float y,float w,float h){
-    fprintf(stderr,"[drawImageRect] w=%d h=%d dirty=%d texID=%u x=%.0f y=%.0f\n",
-            img.width,img.height,img.dirty,img.texID,x,y); fflush(stderr);
     if(img.width==0||img.height==0) return;
     if(img.dirty) img.uploadTexture();
-    fprintf(stderr,"[drawImageRect] after upload texID=%u\n",img.texID); fflush(stderr);
     if(img.texID==0) return;
-    // Apply imageMode
-    if(currentImageMode==CENTER){  x-=w*0.5f; y-=h*0.5f; }
-    else if(currentImageMode==CORNERS){ w=w-x; h=h-y; }
-    // Apply alpha blending for transparent images
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_TEXTURE_2D);
@@ -1750,27 +2089,64 @@ static void drawImageRect(PImage& img,float x,float y,float w,float h){
     glEnd();
     glBindTexture(GL_TEXTURE_2D,0);
     glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+    // Restore white so non-textured drawing after image() looks correct
+    glColor4f(1.f,1.f,1.f,1.f);
 }
-void image(const PImage& img,float x,float y) {
-    fprintf(stderr,"[image] &img=%p w=%d h=%d texID=%u\n",(void*)&img,img.width,img.height,img.texID); fflush(stderr);
-    if(img.width==0||img.height==0)return;
-    drawImageRect(const_cast<PImage&>(img),x,y,(float)img.width,(float)img.height);
+
+// ── image() canonical implementation ─────────────────────────────────────────
+// Single entry point: everything goes through drawImage_impl.
+// Takes a raw PImage pointer so no reference/ABI issues across TUs.
+static void drawImage_impl(PImage* img, float x, float y, float w, float h) {
+    if (!img || img->width == 0 || img->height == 0) return;
+    // Apply imageMode to x,y,w,h
+    float dx = x, dy = y, dw = w, dh = h;
+    if (currentImageMode == CENTER)  { dx -= dw*0.5f; dy -= dh*0.5f; }
+    else if (currentImageMode == CORNERS) { dw = w - x; dh = h - y; dx = x; dy = y; }
+    drawImageRect(*img, dx, dy, dw, dh);
 }
-void image(const PImage& img,float x,float y,float w,float h) {
-    if(img.width==0||img.height==0)return;
-    drawImageRect(const_cast<PImage&>(img),x,y,w,h);
+
+// ── Public image() entry points ─────────────────────────────────────────────
+static void drawPGraphicsRect(PGraphics& pg, float x, float y, float w, float h){
+    if(pg.width==0||pg.height==0) return;
+    if(pg.texID==0) return;
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,pg.texID);
+    glColor4f(1,1,1,1);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0,1);glVertex2f(x,y);     // v=1 at top = Processing y=0
+    glTexCoord2f(1,1);glVertex2f(x+w,y);
+    glTexCoord2f(1,0);glVertex2f(x+w,y+h); // v=0 at bottom = Processing y=h
+    glTexCoord2f(0,0);glVertex2f(x,y+h);
+    glEnd();
+    glBindTexture(GL_TEXTURE_2D,0); glDisable(GL_TEXTURE_2D); glDisable(GL_BLEND);
+    glColor4f(1,1,1,1);
 }
+void image(PGraphics& pg, float x, float y){ drawPGraphicsRect(pg,x,y,(float)pg.width,(float)pg.height); }
+void image(PGraphics& pg, float x, float y, float w, float h){ drawPGraphicsRect(pg,x,y,w,h); }
+void image(PImage* img, float x, float y) {
+    if(!img || img->width==0 || img->height==0) return;
+    drawImage_impl(img, x, y, (float)img->width, (float)img->height);
+}
+void image(PImage* img, float x, float y, float w, float h) {
+    if(!img || img->width==0 || img->height==0) return;
+    drawImage_impl(img, x, y, w, h);
+}
+
 void imageMode(int m){currentImageMode=m;}
+void tint(float gray)           {tint(gray, colorMaxA);}
 void tint(float gray, float a) {
-    color c = makeColor(gray, a); unsigned int v = c.value;
-    tintR=(v>>16&0xFF)/255.f; tintG=(v>>8&0xFF)/255.f;
-    tintB=(v&0xFF)/255.f;     tintA=(v>>24&0xFF)/255.f;
+    // tint(gray, alpha) -- both in 0-255 range like Processing Java
+    tintR = tintG = tintB = gray / 255.f;
+    tintA = a / 255.f;
     doTint = true;
 }
 void tint(float r, float g, float b, float a) {
-    color c = makeColor(r, g, b, a); unsigned int v = c.value;
-    tintR=(v>>16&0xFF)/255.f; tintG=(v>>8&0xFF)/255.f;
-    tintB=(v&0xFF)/255.f;     tintA=(v>>24&0xFF)/255.f;
+    // tint(r, g, b, alpha) -- all in 0-255 range
+    tintR = r / 255.f;
+    tintG = g / 255.f;
+    tintB = b / 255.f;
+    tintA = a / 255.f;
     doTint = true;
 }
 void noTint(){doTint=false;}
@@ -1960,6 +2336,7 @@ static void key_cb(GLFWwindow* w, int k, int /*scancode*/, int action, int mods)
             case GLFW_KEY_ENTER:
             case GLFW_KEY_KP_ENTER:  key = (char)10;  break;
             case GLFW_KEY_ESCAPE:    key = (char)27;  break;
+            case GLFW_KEY_SPACE:     key = (char)32;  break;
             case GLFW_KEY_DELETE:    key = (char)127; break;
             // All other special keys set key=CODED
             case GLFW_KEY_UP: case GLFW_KEY_DOWN:
@@ -1998,6 +2375,9 @@ static void key_cb(GLFWwindow* w, int k, int /*scancode*/, int action, int mods)
         // Fire keyPressed() now unless deferred to char_cb
         if (!g_pendingKeyPressed) {
             if (_onKeyPressed) _onKeyPressed();
+            // Java Processing: ESC closes the sketch unless keyPressed() set key=0
+            if (key == (char)27 && gWindow)
+                glfwSetWindowShouldClose(gWindow, GLFW_TRUE);
         }
 
     } else if (action == GLFW_RELEASE) {
@@ -2018,10 +2398,11 @@ static void winsize_cb(GLFWwindow*,int lw,int lh){
     if(!lw||!lh||_inWinsizeCb)return;
     _inWinsizeCb = true;
     if(_setupDone){
-        // Update winWidth/winHeight for resizable sketches.
-        // logicalW/H stay fixed at what size() requested.
-        // For non-resizable sketches this is just cosmetic.
-        if(isResizable){ winWidth=lw; winHeight=lh; }
+        if(isResizable){
+            // Update logical size for resizable sketches so width/height reflect new size
+            winWidth=lw; winHeight=lh;
+            logicalW=lw; logicalH=lh;
+        }
         if(_onWindowResized)_onWindowResized();
     }
     // setProjection uses logicalW/H for ortho, actual size for viewport.
@@ -2058,15 +2439,15 @@ void enableDebugConsole() {
         freopen_s(&f, "CONOUT$", "w", stderr);
         freopen_s(&f, "CONIN$",  "r", stdin);
         fprintf(stderr, "[debug] ProcessingGL debug console enabled\n");
-        fflush(stderr);
     }
 #endif
 }
 
 void run(){
+    // Write directly to a file since -mwindows kills stderr on Windows
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::srand((unsigned)std::time(nullptr));
-    buildNoisePerm(0);
+    initPerlin(0); // initialize noise table with default seed
 
     if(!glfwInit()){
         fprintf(stderr, "[ERR] glfwInit() failed. Make sure libglfw3.dll is next to ide.exe\n");
@@ -2092,7 +2473,7 @@ void run(){
     settings();
 
     glfwWindowHint(GLFW_RESIZABLE,isResizable?GLFW_TRUE:GLFW_FALSE);
-    glfwWindowHint(GLFW_SAMPLES,4);
+    glfwWindowHint(GLFW_SAMPLES,4); // 4x MSAA for crisp P3D rendering; 2D noSmooth() disables at runtime
     glfwWindowHint(GLFW_STENCIL_BITS,8);  // needed for concave shape fill
     gWindow=glfwCreateWindow(winWidth,winHeight,"ProcessingGL",nullptr,nullptr);
     if(!gWindow){
@@ -2115,6 +2496,8 @@ void run(){
         glfwDestroyWindow(gWindow); glfwTerminate(); return;
     }
 
+    // Reset cached Phong shader so it recompiles fresh with current source
+    if(phongProg){glDeleteProgram(phongProg);phongProg=0;}
     glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_DEPTH_TEST);
     glShadeModel(GL_SMOOTH);
@@ -2128,7 +2511,7 @@ void run(){
     // Enable sticky keys/buttons: GLFW will keep state as PRESSED until polled,
     // Clear both buffers once at startup so the sketch starts with
     // a known clean state (no GPU garbage in either buffer).
-    glClearColor(0,0,0,1);
+    glClearColor(0.8f,0.8f,0.8f,1); // Java Processing default grey
     glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
     glfwSwapBuffers(gWindow);
     glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
@@ -2163,15 +2546,29 @@ void run(){
     // sets the correct viewport. After settling, setup() and draw() use the
     // correct dimensions from the start -- no shifted first frame.
     _setupDone = true; // enable winsize_cb to update projection during settle
+    // Initialize the framebuffer before the settle loop -- required on Windows
+    // to avoid swapping an uninitialized back buffer which crashes the driver.
+    glClearColor(0.8f,0.8f,0.8f,1);
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+    glfwSwapBuffers(gWindow);
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+    glfwSwapBuffers(gWindow);
     for (int _settle = 0; _settle < 5; _settle++) {
+        glClearColor(0.8f,0.8f,0.8f,1);
+        glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
         glfwPollEvents();
         glfwSwapBuffers(gWindow);
     }
     if (!defaultP3D) setProjection(winWidth, winHeight);
 
     setup();
-
-    fprintf(stderr, "[ProcessingGL] setup() completed\n"); fflush(stderr);
+    // 2D sketches: disable MSAA so pixels stay crisp (noSmooth() effect).
+    // P3D sketches keep MSAA from window creation for smooth 3D edges.
+    if (!defaultP3D) {
+        glDisable(GL_MULTISAMPLE);
+        glDisable(GL_POINT_SMOOTH);
+        glDisable(GL_LINE_SMOOTH);
+    }
     if (_wireCallbacksFn) _wireCallbacksFn();
 
     if (!defaultP3D) {
@@ -2198,20 +2595,26 @@ void run(){
         } else {
             setProjection(logicalW, logicalH);
         }
-        draw(); ++frameCount;
+        ++frameCount; draw();
+        flushPoints(); // flush any pending points before swap
         glfwSwapBuffers(gWindow);
     }
 
-    fprintf(stderr, "[ProcessingGL] entering main loop, looping=%d gWindow=%p\n",
-            looping, (void*)gWindow); fflush(stderr);
-    if(glfwWindowShouldClose(gWindow)){
-        fprintf(stderr, "[ProcessingGL] window already wants to close before loop!\n"); fflush(stderr);
-    }
     redrawOnce = looping;
     auto last=std::chrono::steady_clock::now();
+    // Drain Windows message queue before entering main loop.
+    // On Windows, a WM_QUIT from a previous sketch run can be in the queue.
+    // Poll multiple times to flush it, then forcibly clear the close flag.
+    for(int _flush=0; _flush<10; _flush++) glfwPollEvents();
+    glfwSetWindowShouldClose(gWindow, GLFW_FALSE);
+    // Clear both buffers to the background color set during setup()
+    // so the front-to-back blit starts from the correct color.
+    for(int _b=0;_b<2;_b++){
+        glClearColor(bgR,bgG,bgB,bgA);
+        glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+        glfwSwapBuffers(gWindow);
+    }
     while(!glfwWindowShouldClose(gWindow)){
-        static int frameDbg=0;
-        if(frameDbg<3){ fprintf(stderr,"[frame %d] start\n",frameDbg); fflush(stderr); }
         pmouseX=mouseX;pmouseY=mouseY;
         if(looping||redrawOnce){
             redrawOnce=false;
@@ -2225,7 +2628,8 @@ void run(){
                 glEnable(GL_NORMALIZE);
                 // Do NOT clear color here -- the sketch calls background() itself.
                 // Clearing color would erase anything drawn in setup().
-                glClear(GL_DEPTH_BUFFER_BIT);
+                flushPoints(); // flush any pending points from previous frame
+            glClear(GL_DEPTH_BUFFER_BIT);
                 // Auto-apply the default Processing camera BEFORE draw() --
                 // matches Java Processing behaviour exactly. The sketch can
                 // override by calling camera() / perspective() itself.
@@ -2244,15 +2648,13 @@ void run(){
                 glMatrixMode(GL_MODELVIEW); glLoadIdentity();
                 glDisable(GL_DEPTH_TEST);
                 glDisable(GL_LIGHTING);
-                // Copy front buffer -> back buffer so incremental drawing
-                // (sketches that don't call background() every frame) accumulates
-                // correctly across frames without flickering.
-                // Sketches that DO call background() will overwrite this anyway.
-                // Do not auto-clear color -- the sketch calls background() itself.
-                // Sketches that draw incrementally (without background() each frame)
-                // will accumulate in the back buffer naturally across frames.
-                // Note: double-buffering means alternating back buffers -- sketches
-                // needing true frame accumulation should use a PGraphics offscreen buffer.
+                // Copy front buffer to back buffer so accumulating sketches
+                // (no background() each frame) work correctly with double buffering.
+                // Sketches that call background() will just overwrite this.
+                glReadBuffer(GL_FRONT);
+                glDrawBuffer(GL_BACK);
+                glBlitFramebuffer(0,0,fbW,fbH, 0,0,fbW,fbH,
+                                  GL_COLOR_BUFFER_BIT, GL_NEAREST);
                 glClear(GL_DEPTH_BUFFER_BIT);
             }
 
@@ -2269,8 +2671,13 @@ void run(){
             }
             glDisable(GL_LIGHTING);
             glDisable(GL_COLOR_MATERIAL);
+            // No global ambient by default (Java Processing uses 0 unless ambientLight() called)
+            GLfloat noAmb[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            glLightModelfv(GL_LIGHT_MODEL_AMBIENT, noAmb);
             lightsEnabled = false;
             lightIndex    = 0;
+            pendingSpecR=0; pendingSpecG=0; pendingSpecB=0;
+            for(int _li=0;_li<8;_li++){lightConcentration[_li]=0;lightCutoffCos[_li]=-1;}
             // Reset material to neutral so non-lit objects look correct
             GLfloat matWhite[] = { 0.8f, 0.8f, 0.8f, 1.0f };
             GLfloat matBlack[] = { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -2278,6 +2685,10 @@ void run(){
             glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE,  matWhite);
             glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, matBlack);
             glMaterialf (GL_FRONT_AND_BACK, GL_SHININESS, 0.0f);
+            // Reset specular material to none
+            GLfloat noSpec[] = {0,0,0,1};
+            glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, noSpec);
+            glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, noSpec);
 
             // Draw guard: handle different sketch types
             if (!looping && _staticSketchSetup) {
@@ -2293,18 +2704,14 @@ void run(){
                 // Run draw() every frame -- no mouseInWindow guard.
                 // The Hue sketch first-frame issue is handled by the settle loop
                 // ensuring mouseX/mouseY are 0 which is acceptable.
-                glGetError(); // clear any pending GL errors
-                fprintf(stderr,"[frame %d] calling draw()\n",frameCount); fflush(stderr);
-                draw(); ++frameCount;
-                fprintf(stderr,"[frame %d] draw() returned\n",frameCount); fflush(stderr);
-                GLenum glerr = glGetError();
-                if (glerr != GL_NO_ERROR) {
-                    fprintf(stderr, "[GL error 0x%X in draw frame %d]\n", glerr, frameCount);
-                }
+                // Reset tint state each frame (Processing Java behavior)
+                doTint=false; tintR=1; tintG=1; tintB=1; tintA=1;
+                glGetError();
+                ++frameCount; draw();
+                glGetError(); // consume any GL errors
             }
 
             glfwSwapBuffers(gWindow);
-            if(frameCount<=2){ fprintf(stderr,"[frame] swapped\n"); fflush(stderr); }
         }
         glfwPollEvents();
         auto now=std::chrono::steady_clock::now();
@@ -2314,6 +2721,7 @@ void run(){
         if(sl>0)std::this_thread::sleep_for(std::chrono::duration<double>(sl));
         last=std::chrono::steady_clock::now();
     }
+    if(phongProg){glDeleteProgram(phongProg);phongProg=0;}
     glfwDestroyWindow(gWindow);gWindow=nullptr;glfwTerminate();
 }
 
@@ -2527,24 +2935,649 @@ bool saveTable(const std::string& path,const Table& t,const std::string& ext){
 static int shapeDrawMode=CORNER;
 void shapeMode(int mode){ shapeDrawMode=mode; }
 PShape createShape(int kind){ return PShape(kind); }
-PShape* loadShape(const std::string& path){ std::cerr<<"loadShape: SVG not implemented: "<<path<<"\n"; return new PShape(); }
 
-static void drawPShape(const PShape& s,float x,float y,float w=-1,float h=-1){
+// ── Minimal SVG loader ────────────────────────────────────────────────────────
+// Parses basic SVG shapes (path, rect, circle, ellipse, polygon, polyline, line)
+// into PShape children for rendering. Handles fill/stroke from style attributes.
+
+static float svgParseFloat(const std::string& s, size_t& i){
+    while(i<s.size()&&(s[i]==' '||s[i]==','))i++;
+    size_t j=i;
+    if(j<s.size()&&(s[j]=='-'||s[j]=='+'))j++;
+    while(j<s.size()&&(isdigit(s[j])||s[j]=='.'||s[j]=='e'||s[j]=='E'||((s[j]=='-'||s[j]=='+')&&j>i&&(s[j-1]=='e'||s[j-1]=='E'))))j++;
+    float v=0; try{v=std::stof(s.substr(i,j-i));}catch(...){}
+    i=j; return v;
+}
+static uint32_t svgParseColor(const std::string& s){
+    if(s.empty()||s=="none") return 0;
+    if(s[0]=='#'){
+        std::string h=s.substr(1);
+        if(h.size()==3)h={h[0],h[0],h[1],h[1],h[2],h[2]};
+        uint32_t v=0; try{v=(uint32_t)std::stoul(h,nullptr,16);}catch(...){}
+        return v|0xFF000000u;
+    }
+    // Named colors (common subset)
+    static const std::unordered_map<std::string,uint32_t> nc={
+        {"black",0xFF000000},{"white",0xFFFFFFFF},{"red",0xFF0000FF},
+        {"green",0xFF008000},{"blue",0xFF0000FF},{"none",0},
+        {"gray",0xFF808080},{"grey",0xFF808080},{"yellow",0xFFFFFF00},
+    };
+    auto it=nc.find(s); return it!=nc.end()?it->second:0xFF000000;
+}
+static std::string svgAttr(const std::string& tag, const std::string& attr){
+    // Find attr="value" -- whole-word match to avoid "id=" matching "d="
+    size_t p=0;
+    std::string needle=attr+"=";
+    while(true){
+        p=tag.find(needle,p);
+        if(p==std::string::npos) return "";
+        // Must be preceded by space, tab, or start (whole attribute name)
+        bool ok=(p==0||tag[p-1]==' '||tag[p-1]==9||tag[p-1]==58); // 58=':'
+        if(ok) break;
+        p++;
+    }
+    p+=needle.size();
+    if(p>=tag.size()) return "";
+    char q=tag[p++];
+    if(q!=34&&q!=39) return ""; // 34='"', 39="'"
+    size_t e=tag.find(q,p);
+    return e==std::string::npos?tag.substr(p):tag.substr(p,e-p);
+}
+static void svgApplyStyle(PShape& sh, const std::string& tag){
+    // Parse style="..." or individual fill/stroke/stroke-width attrs
+    std::string style=svgAttr(tag,"style");
+    auto getVal=[&](const std::string& k)->std::string{
+        // from inline style
+        size_t p=style.find(k+":"); if(p!=std::string::npos){
+            p+=k.size()+1; while(p<style.size()&&style[p]==' ')p++;
+            size_t e=style.find(';',p); return style.substr(p,e==std::string::npos?std::string::npos:e-p);
+        }
+        // from attribute
+        return svgAttr(tag,k);
+    };
+    std::string fs=getVal("fill"),ss=getVal("stroke"),sw=getVal("stroke-width"),op=getVal("opacity"),fo=getVal("fill-opacity");
+    float alpha=1.0f;
+    if(!op.empty())try{alpha=std::stof(op);}catch(...){}
+    float falpha=alpha;
+    if(!fo.empty())try{falpha=std::stof(fo)*alpha;}catch(...){}
+    if(!fs.empty()&&fs!="none"){
+        uint32_t c=svgParseColor(fs);
+        sh.setFill(((c>>16)&0xFF)/255.f,((c>>8)&0xFF)/255.f,(c&0xFF)/255.f,falpha);
+        sh.hasFill=true;
+    } else if(fs=="none"){sh.hasFill=false;}
+    if(!ss.empty()&&ss!="none"){
+        uint32_t c=svgParseColor(ss);
+        sh.setStroke(((c>>16)&0xFF)/255.f,((c>>8)&0xFF)/255.f,(c&0xFF)/255.f,alpha);
+        sh.hasStroke=true;
+    }
+    if(!sw.empty())try{sh.strokeW=std::stof(sw);}catch(...){}
+}
+
+// Parse SVG path 'd' attribute into vertices
+static PShape svgParsePath(const std::string& tag){
+    PShape sh; sh.kind=-1; sh.hasFill=true; sh.hasStroke=false;
+    svgApplyStyle(sh,tag);
+    std::string d=svgAttr(tag,"d");
+    if(d.empty())return sh;
+    float cx=0,cy=0,sx=0,sy=0; // current pos and subpath start
+    float lcx2=0,lcy2=0; // last control point (for S/T reflection)
+    char lastCmd=0;
+    size_t i=0;
+    auto nextF=[&]()->float{
+        while(i<d.size()&&(d[i]==' '||d[i]==','||d[i]=='\t'||d[i]=='\n'||d[i]=='\r'))i++;
+        return svgParseFloat(d,i);
+    };
+    int maxIter=100000, iter=0;
+    while(i<d.size()&&iter++<maxIter){
+        while(i<d.size()&&(d[i]==' '||d[i]==','||d[i]=='\t'||d[i]=='\n'||d[i]=='\r'))i++;
+        if(i>=d.size())break;
+        char cmd=d[i];
+        bool isCmd=isalpha((unsigned char)cmd);
+        if(isCmd){i++;lastCmd=cmd;}
+        else cmd=lastCmd;
+        if(!cmd)break;
+        bool rel=islower((unsigned char)cmd);
+        char C=(char)toupper((unsigned char)cmd);
+
+        if(C=='M'){
+            float x=nextF()+(rel?cx:0),y=nextF()+(rel?cy:0);
+            // Track where each subpath starts
+            sh.subpathStarts.push_back((int)sh.verts.size());
+            sh.verts.push_back({x,y,0,0,0}); cx=x;cy=y; sx=cx;sy=cy;
+            lastCmd=rel?'l':'L';
+        } else if(C=='L'){
+            float x=nextF()+(rel?cx:0),y=nextF()+(rel?cy:0);
+            sh.verts.push_back({x,y,0,0,0}); cx=x;cy=y;
+        } else if(C=='H'){
+            float x=nextF()+(rel?cx:0);
+            sh.verts.push_back({x,cy,0,0,0}); cx=x;
+        } else if(C=='V'){
+            float y=nextF()+(rel?cy:0);
+            sh.verts.push_back({cx,y,0,0,0}); cy=y;
+        } else if(C=='C'){
+            float x1=nextF()+(rel?cx:0),y1=nextF()+(rel?cy:0);
+            float x2=nextF()+(rel?cx:0),y2=nextF()+(rel?cy:0);
+            float x=nextF()+(rel?cx:0),y=nextF()+(rel?cy:0);
+            {
+                // Adaptive segments: based on chord length of control polygon
+                float dx1=x1-cx,dy1=y1-cy,dx2=x2-x1,dy2=y2-y1,dx3=x-x2,dy3=y-y2;
+                float clen=std::sqrt(dx1*dx1+dy1*dy1)+std::sqrt(dx2*dx2+dy2*dy2)+std::sqrt(dx3*dx3+dy3*dy3);
+                int seg=std::max(2,(int)(clen/2));if(seg>128)seg=128;
+                for(int s2=1;s2<=seg;s2++){
+                    float t=s2/(float)seg,u=1-t;
+                    sh.verts.push_back({u*u*u*cx+3*u*u*t*x1+3*u*t*t*x2+t*t*t*x,
+                                        u*u*u*cy+3*u*u*t*y1+3*u*t*t*y2+t*t*t*y,0,0,0});
+                }
+            }
+            lcx2=x2;lcy2=y2; cx=x;cy=y;
+        } else if(C=='S'){
+            // Smooth cubic: reflect last C's second control point
+            float x1=2*cx-lcx2,y1=2*cy-lcy2;
+            float x2=nextF()+(rel?cx:0),y2=nextF()+(rel?cy:0);
+            float x=nextF()+(rel?cx:0),y=nextF()+(rel?cy:0);
+            for(int s2=1;s2<=20;s2++){
+                float t=s2/20.f,u=1-t;
+                float bx=u*u*u*cx+3*u*u*t*x1+3*u*t*t*x2+t*t*t*x;
+                float by=u*u*u*cy+3*u*u*t*y1+3*u*t*t*y2+t*t*t*y;
+                sh.verts.push_back({bx,by,0,0,0});
+            }
+            lcx2=x2;lcy2=y2; cx=x;cy=y;
+        } else if(C=='Q'){
+            float x1=nextF()+(rel?cx:0),y1=nextF()+(rel?cy:0);
+            float x=nextF()+(rel?cx:0),y=nextF()+(rel?cy:0);
+            for(int s2=1;s2<=20;s2++){
+                float t=s2/20.f,u=1-t;
+                sh.verts.push_back({u*u*cx+2*u*t*x1+t*t*x,u*u*cy+2*u*t*y1+t*t*y,0,0,0});
+            }
+            lcx2=x1;lcy2=y1; cx=x;cy=y;
+        } else if(C=='T'){
+            // Smooth quadratic: reflect last Q's control point
+            float x1=2*cx-lcx2,y1=2*cy-lcy2;
+            float x=nextF()+(rel?cx:0),y=nextF()+(rel?cy:0);
+            for(int s2=1;s2<=20;s2++){
+                float t=s2/20.f,u=1-t;
+                sh.verts.push_back({u*u*cx+2*u*t*x1+t*t*x,u*u*cy+2*u*t*y1+t*t*y,0,0,0});
+            }
+            lcx2=x1;lcy2=y1; cx=x;cy=y;
+        } else if(C=='A'){
+            float rx=nextF(),ry=nextF();
+            nextF();nextF();nextF(); // x-rot, large-arc, sweep
+            float ex=nextF()+(rel?cx:0),ey=nextF()+(rel?cy:0);
+            // Approximate arc with line to endpoint
+            {
+                // Approximate arc chord length for adaptive segments
+                float adx=ex-cx,ady=ey-cy;
+                float chord=std::sqrt(adx*adx+ady*ady);
+                // rx,ry give the arc radius -- use larger for segment count
+                float r2=std::max(rx,ry);
+                int arcSeg=std::max(4,(int)(chord/2));
+                if(r2>0){int byRadius=(int)(r2*0.5f);if(byRadius>arcSeg)arcSeg=byRadius;}
+                if(arcSeg>96)arcSeg=96;
+                for(int s2=1;s2<=arcSeg;s2++){
+                    float t=s2/(float)arcSeg;
+                    sh.verts.push_back({cx+(ex-cx)*t, cy+(ey-cy)*t,0,0,0});
+                }
+            }
+            cx=ex;cy=ey;
+        } else if(C=='Z'){
+            sh.closed=true;
+            sh.verts.push_back({sx,sy,0,0,0});
+            cx=sx;cy=sy;
+        } else {
+            // Unknown -- skip to next alpha or end
+            while(i<d.size()&&!isalpha((unsigned char)d[i])&&d[i]!=' ')i++;
+            if(i<d.size()&&!isalpha((unsigned char)d[i]))i++;
+        }
+    }
+    return sh;
+}
+
+static PShape* svgLoad(const std::string& path){
+    // Search paths
+    std::vector<std::string> tries={path,"data/"+path,"files/"+path};
+    std::string found;
+    for(auto& t:tries){FILE* f=fopen(t.c_str(),"r");if(f){fclose(f);found=t;break;}}
+    if(found.empty()){std::cerr<<"loadShape: file not found: "<<path<<"\n";return new PShape();}
+
+    std::ifstream f(found);
+    std::string xml((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>());
+
+    PShape* root=new PShape();
+    root->hasFill=false;
+    // Extract viewBox for scaling
+    float vbW=0,vbH=0;
+    size_t vbp=xml.find("viewBox=");
+    if(vbp!=std::string::npos){
+        vbp+=9;size_t i2=vbp;
+        svgParseFloat(xml,i2);svgParseFloat(xml,i2); // minX minY
+        vbW=svgParseFloat(xml,i2);vbH=svgParseFloat(xml,i2);
+    }
+
+    // Parse all shape elements
+    size_t p=0;
+    int maxTags=20000, tagCount=0;
+    std::string currentGroupId; // id from nearest enclosing <g id="...">
+    std::vector<std::string> groupIdStack; // stack for nested groups
+    while(p<xml.size() && tagCount++<maxTags){
+        size_t lt=xml.find('<',p); if(lt==std::string::npos)break;
+        // Skip comments <!-- ... -->
+        if(lt+3<xml.size() && xml.substr(lt,4)=="<!--"){
+            size_t end=xml.find("-->",lt+4);
+            p=(end==std::string::npos)?xml.size():end+3; continue;
+        }
+        // Skip DOCTYPE and CDATA <! ... > (may contain > inside [...])
+        if(lt+1<xml.size() && xml[lt+1]=='!'){
+            // Find matching > accounting for [] nesting
+            size_t i2=lt+2; int brackets=0;
+            while(i2<xml.size()){
+                if(xml[i2]=='[') brackets++;
+                else if(xml[i2]==']') brackets--;
+                else if(xml[i2]=='>' && brackets<=0){i2++;break;}
+                i2++;
+            }
+            p=i2; continue;
+        }
+                // Find closing > -- skip quoted attribute values
+        size_t gt=lt+1;
+        {
+            bool inQ=false; char qc=0;
+            while(gt<xml.size()){
+                char c3=xml[gt];
+                if(!inQ && (c3==34||c3==39)){ inQ=true; qc=c3; gt++; }
+                else if(inQ && c3==qc){ inQ=false; gt++; }
+                else if(!inQ && c3==62){ break; }
+                else gt++;
+            }
+        }
+        if(gt>=xml.size())break;
+        std::string tag=xml.substr(lt+1,gt-lt-1);
+        p=gt+1;
+        if(tag.empty()||tag[0]=='?')continue;
+        if(tag[0]=='/'){
+            // Closing tag
+            std::string ctag=tag.substr(1);
+            size_t csp=ctag.find_first_of(" /\t");
+            if(csp!=std::string::npos) ctag=ctag.substr(0,csp);
+            if(ctag=="g"&&!groupIdStack.empty()){
+                groupIdStack.pop_back();
+                currentGroupId=groupIdStack.empty()?"":groupIdStack.back();
+            }
+            continue;
+        }
+        // Remove newlines/tabs from tag for easier parsing
+        for(size_t ci2=0;ci2<tag.size();ci2++) if(tag[ci2]==10||tag[ci2]==13||tag[ci2]==9) tag[ci2]=' ';
+        // get element name
+        size_t sp=tag.find_first_of(" /");
+        std::string elem=(sp==std::string::npos)?tag:tag.substr(0,sp);
+
+        PShape child;
+        if(elem=="path"){
+            child=svgParsePath(tag);
+        } else if(elem=="rect"){
+            float x=0,y=0,w=0,h=0,rx=0,ry=0;
+            auto a=[&](const std::string& k)->float{std::string v=svgAttr(tag,k);if(v.empty())return 0;try{return std::stof(v);}catch(...){return 0;}};
+            x=a("x");y=a("y");w=a("width");h=a("height");rx=a("rx");ry=a("ry");
+            child.kind=-1; svgApplyStyle(child,tag);
+            child.verts.push_back({x,y,0,0,0});child.verts.push_back({x+w,y,0,0,0});
+            child.verts.push_back({x+w,y+h,0,0,0});child.verts.push_back({x,y+h,0,0,0});
+            child.closed=true;
+        } else if(elem=="circle"||elem=="ellipse"){
+            float cx2=0,cy2=0,rx=0,ry=0;
+            auto a=[&](const std::string& k)->float{std::string v=svgAttr(tag,k);if(v.empty())return 0;try{return std::stof(v);}catch(...){return 0;}};
+            cx2=a("cx");cy2=a("cy");
+            if(elem=="circle"){rx=ry=a("r");}else{rx=a("rx");ry=a("ry");}
+            child.kind=-1; svgApplyStyle(child,tag);
+            int seg=32;
+            for(int s2=0;s2<=seg;s2++){
+                float t=s2*TWO_PI/seg;
+                child.verts.push_back({cx2+cos(t)*rx,cy2+sin(t)*ry,0,0,0});
+            }
+            child.closed=true;
+        } else if(elem=="polygon"||elem=="polyline"){
+            child.kind=-1; svgApplyStyle(child,tag);
+            child.closed=(elem=="polygon");
+            std::string pts=svgAttr(tag,"points"); size_t pi=0;
+            while(pi<pts.size()){
+                while(pi<pts.size()&&(pts[pi]==' '||pts[pi]==','))pi++;
+                if(pi>=pts.size())break;
+                float x=svgParseFloat(pts,pi),y=svgParseFloat(pts,pi);
+                child.verts.push_back({x,y,0,0,0});
+            }
+        } else if(elem=="line"){
+            child.kind=LINES; svgApplyStyle(child,tag);
+            auto a=[&](const std::string& k)->float{std::string v=svgAttr(tag,k);if(v.empty())return 0;try{return std::stof(v);}catch(...){return 0;}};
+            child.verts.push_back({a("x1"),a("y1"),0,0,0});
+            child.verts.push_back({a("x2"),a("y2"),0,0,0});
+        } else if(elem=="defs"||elem=="title"||elem=="desc"){
+            continue;
+        } else if(elem=="svg"){
+            continue;
+        } else if(elem=="g"){
+            // Push group id onto stack so child shapes inherit it
+            std::string gid=svgAttr(tag,"id");
+            if(gid.empty()) gid=svgAttr(tag,"inkscape:label");
+            groupIdStack.push_back(gid);
+            currentGroupId=gid.empty()?currentGroupId:gid;
+            continue;
+        } else continue;
+
+        {
+            std::string sid = svgAttr(tag,"id");
+            if(sid.empty()) sid = svgAttr(tag,"inkscape:label");
+            if(sid.empty()) sid = currentGroupId;
+            child.name = sid;
+            // Always add child so getChildCount() matches Java Processing
+            root->children.push_back(child);
+        }
+        // Also handle <g id="..."> groups by storing named empty shapes
+        // so getChild can find them even if they hold no direct verts
+    }
+
+    // Store viewBox dimensions on root shape for reference
+    // Do NOT normalize coordinates -- keep raw SVG space so shape(s,x,y) works
+    // with sketch-supplied offsets. shape(s,x,y,w,h) will scale via glScalef.
+    if(vbW>0&&vbH>0){
+        root->verts.push_back({vbW,vbH,0,0,0}); // store vbW,vbH as sentinel in root
+    }
+    root->computeBounds();
+    return root;
+}
+
+// ── OBJ Loader ───────────────────────────────────────────────────────────────
+
+// Per-vertex data for OBJ (stored flat in child PShape)
+struct ObjVertex {
+    float x,y,z;   // position
+    float nx,ny,nz; // normal
+    float u,v;     // texcoord
+};
+
+static std::string objDir; // directory of the OBJ file
+
+// Parse MTL file, return map of material name -> texture PImage*
+static std::unordered_map<std::string,GLuint> objLoadMtl(const std::string& mtlPath){
+    std::unordered_map<std::string,GLuint> mats;
+    std::ifstream f(mtlPath);
+    if(!f.is_open()) return mats;
+    std::string curMat, line;
+    while(std::getline(f,line)){
+        if(line.empty()||line[0]=='#') continue;
+        std::istringstream ss(line);
+        std::string tok; ss>>tok;
+        if(tok=="newmtl"){ ss>>curMat; }
+        else if((tok=="map_Kd"||tok=="map_Ka")&&!curMat.empty()&&mats.find(curMat)==mats.end()){
+            std::string texFile; ss>>texFile;
+            // Try relative to obj dir
+            std::vector<std::string> tries={
+                objDir+texFile, objDir+"data/"+texFile,
+                "data/"+texFile, texFile
+            };
+            for(auto& t:tries){
+                #ifdef PROCESSING_HAS_STB_IMAGE
+                int w2,h2,ch;
+                unsigned char* d=stbi_load(t.c_str(),&w2,&h2,&ch,4);
+                if(d){
+                    GLuint tex;
+                    glGenTextures(1,&tex);
+                    glBindTexture(GL_TEXTURE_2D,tex);
+                    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w2,h2,0,GL_RGBA,GL_UNSIGNED_BYTE,d);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_REPEAT);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_REPEAT);
+                    glBindTexture(GL_TEXTURE_2D,0);
+                    stbi_image_free(d);
+                    mats[curMat]=tex;
+                                    break;
+                }
+                #endif
+            }
+        }
+    }
+    return mats;
+}
+
+static PShape* objLoad(const std::string& path){
+    std::vector<std::string> tries={path,"data/"+path,"files/"+path};
+    std::string found;
+    for(auto& t:tries){FILE* f2=fopen(t.c_str(),"r");if(f2){fclose(f2);found=t;break;}}
+    if(found.empty()){std::cerr<<"loadShape: OBJ not found: "<<path<<"\n";return new PShape();}
+
+    // Get directory for relative texture paths
+    size_t slash=found.find_last_of("/\\");
+    objDir=(slash==std::string::npos)?"":found.substr(0,slash+1);
+
+    std::vector<std::array<float,3>> vp,vn;
+    std::vector<std::array<float,2>> vt;
+    std::unordered_map<std::string,GLuint> mats; // material name -> GL texture
+
+    PShape* root=new PShape();
+    root->name="__obj__";
+
+    // Current group state
+    struct Group {
+        std::string name, matName;
+        GLuint texId=0;
+        std::vector<ObjVertex> verts;
+    };
+    std::vector<Group> groups;
+    Group* cur=nullptr;
+
+    auto getGroup=[&]()->Group*{
+        if(!cur){groups.push_back({});cur=&groups.back();}
+        return cur;
+    };
+
+    std::ifstream f(found);
+    std::string line;
+    while(std::getline(f,line)){
+        // Strip \r
+        if(!line.empty()&&line.back()=='\r') line.pop_back();
+        if(line.empty()||line[0]=='#') continue;
+        std::istringstream ss(line);
+        std::string tok; ss>>tok;
+        if(tok=="mtllib"){
+            std::string mtlFile; ss>>mtlFile;
+            std::vector<std::string> mtlTries={objDir+mtlFile,"data/"+mtlFile,mtlFile};
+            for(auto& t:mtlTries){
+                std::ifstream test(t);
+                if(test.is_open()){mats=objLoadMtl(t);break;}
+            }
+        } else if(tok=="v"){
+            float x,y,z; ss>>x>>y>>z; vp.push_back({x,y,z});
+        } else if(tok=="vt"){
+            float u,v2=0; ss>>u>>v2; vt.push_back({u,v2});
+        } else if(tok=="vn"){
+            float x,y,z; ss>>x>>y>>z; vn.push_back({x,y,z});
+        } else if(tok=="o"||tok=="g"){
+            groups.push_back({}); cur=&groups.back(); ss>>cur->name;
+        } else if(tok=="usemtl"){
+            std::string mat; ss>>mat;
+            if(!cur){groups.push_back({});cur=&groups.back();}
+            // Start new group for new material
+            if(!cur->verts.empty()){groups.push_back({});cur=&groups.back();}
+            cur->matName=mat;
+            cur->texId=mats.count(mat)?mats[mat]:0;
+        } else if(tok=="f"){
+            std::vector<std::array<int,3>> face;
+            std::string fv;
+            while(ss>>fv){
+                std::array<int,3> idx={0,0,0};
+                std::istringstream fs(fv);
+                std::string part; int fi=0;
+                while(std::getline(fs,part,'/')&&fi<3){
+                    if(!part.empty()) try{idx[fi]=std::stoi(part);}catch(...){}
+                    fi++;
+                }
+                face.push_back(idx);
+            }
+            if(face.size()<3) continue;
+            Group* g=getGroup();
+            for(size_t fi=1;fi+1<face.size();fi++){
+                for(int k=0;k<3;k++){
+                    auto& fc=(k==0)?face[0]:(k==1)?face[fi]:face[fi+1];
+                    ObjVertex ov={};
+                    int vi=fc[0],ti=fc[1],ni=fc[2];
+                    if(vi>0&&vi<=(int)vp.size()){ov.x=vp[vi-1][0];ov.y=vp[vi-1][1];ov.z=vp[vi-1][2];}
+                    else if(vi<0&&(int)vp.size()+vi>=0){auto& p=vp[vp.size()+vi];ov.x=p[0];ov.y=p[1];ov.z=p[2];}
+                    if(ti>0&&ti<=(int)vt.size()){ov.u=vt[ti-1][0];ov.v=1.0f-vt[ti-1][1];} // flip V
+                    if(ni>0&&ni<=(int)vn.size()){ov.nx=vn[ni-1][0];ov.ny=vn[ni-1][1];ov.nz=vn[ni-1][2];}
+                    g->verts.push_back(ov);
+                }
+            }
+        }
+    }
+
+    // Convert groups to PShape children
+    for(auto& g:groups){
+        if(g.verts.empty()) continue;
+        PShape child;
+        child.kind=TRIANGLES;
+        child.hasFill=true; child.hasStroke=false;
+        child.fillR=0.8f;child.fillG=0.8f;child.fillB=0.8f;child.fillA=1.0f;
+        child.name=g.matName;
+        // Pack ObjVertex into PShape::Vertex (x,y,z) + subpathStarts for normals + verts.z4,z5 for uv
+        // Store as flat arrays via a different approach:
+        // verts: position (x,y,z), normal (nx via u field, ny via v field... messy)
+        // Better: pack into verts with a 5-float struct matching PShape::Vertex
+        // PShape::Vertex has {x,y,z,u,v} -- repurpose u,v for texcoords
+        // Store normals separately in subpathStarts encoded as 3 floats packed per vertex
+        for(auto& ov:g.verts){
+            child.verts.push_back({ov.x,ov.y,ov.z,ov.u,ov.v});
+        }
+        // Store normals as extra data: pack 3 floats per vertex into children[0].verts
+        // Use a sibling child marked as normals store
+        PShape norms;
+        norms.kind=-999; // marker for normal data
+        for(auto& ov:g.verts) norms.verts.push_back({ov.nx,ov.ny,ov.nz,0,0});
+        child.children.push_back(norms);
+        // Store texture ID in strokeR (reuse float field)
+        // Better: store as a proper field -- use hasTex + texID on PShape
+        // We'll use the existing texId field if it exists, otherwise pack into a child name
+        child.texId=g.texId;
+        root->children.push_back(child);
+    }
+
+    return root;
+}
+
+PShape* loadShape(const std::string& path){
+    auto ext=[&](const std::string& e)->bool{
+        return path.size()>=e.size()&&path.substr(path.size()-e.size())==e;
+    };
+    if(ext(".svg")||ext(".SVG")) return svgLoad(path);
+    if(ext(".obj")||ext(".OBJ")) return objLoad(path);
+    std::cerr<<"loadShape: unsupported format: "<<path<<"\n";
+    return new PShape();
+}
+
+static void drawPShape(const PShape& s,float x,float y,float w=-1,float h=-1,bool parentStyleEnabled=true){
     if(!s.visible)return;
+    bool se = s.styleEnabled && parentStyleEnabled;
     glPushMatrix();
     glTranslatef(x,y,0);
-    if(w>0&&h>0)glScalef(w,h,1);
-    for(auto& c:s.children)drawPShape(c,0,0);
-    if(!s.verts.empty()){
-        GLenum gm;
-        switch(s.kind){
-            case POINTS:gm=GL_POINTS;break;case LINES:gm=GL_LINES;break;
-            case TRIANGLES:gm=GL_TRIANGLES;break;case TRIANGLE_FAN:gm=GL_TRIANGLE_FAN;break;
-            case TRIANGLE_STRIP:gm=GL_TRIANGLE_STRIP;break;case QUADS:gm=GL_QUADS;break;
-            case QUAD_STRIP:gm=GL_QUAD_STRIP;break;default:gm=GL_POLYGON;break;
+    if(w>0&&h>0){
+        // If root has viewBox stored as sentinel, scale to fit w,h
+        float vbW=1,vbH=1;
+        if(!s.verts.empty() && s.children.empty()==false && s.verts[0].z==0){
+            vbW=s.verts[0].x; vbH=s.verts[0].y;
         }
-        if(s.hasFill){glColor4f(s.fillR,s.fillG,s.fillB,s.fillA);glBegin(gm);for(auto& v:s.verts)glVertex3f(v.x,v.y,v.z);glEnd();}
-        if(s.hasStroke){glColor4f(s.strokeR,s.strokeG,s.strokeB,s.strokeA);glLineWidth(s.strokeW);glBegin(s.closed?GL_LINE_LOOP:GL_LINE_STRIP);for(auto& v:s.verts)glVertex3f(v.x,v.y,v.z);glEnd();}
+        if(vbW>1) glScalef(w/vbW,h/vbH,1);
+        else      glScalef(w,h,1);
+    }
+    for(auto& c:s.children) drawPShape(c,0,0,-1,-1,se);
+    if(!s.verts.empty()){
+        bool useFill   = se ? s.hasFill  : doFill;
+        bool useStroke = se ? s.hasStroke : doStroke;
+        int n=(int)s.verts.size();
+
+        if(useFill && n>=3){
+            if(se) glColor4f(s.fillR,s.fillG,s.fillB,s.fillA);
+            else   applyFill();
+            // OBJ triangles: per-vertex normals + texture
+            if(s.kind==TRIANGLES){
+                const PShape* normStore=nullptr;
+                for(auto& c:s.children) if(c.kind==-999){normStore=&c;break;}
+                bool hasTex=(s.texId!=0);
+                if(hasTex){
+                    glEnable(GL_TEXTURE_2D);
+                    glBindTexture(GL_TEXTURE_2D,s.texId);
+                    glTexEnvi(GL_TEXTURE_ENV,GL_TEXTURE_ENV_MODE,GL_MODULATE);
+                    glColor4f(1,1,1,1);
+                }
+                glBegin(GL_TRIANGLES);
+                for(int vi=0;vi<n;vi++){
+                    if(normStore&&vi<(int)normStore->verts.size()){
+                        glNormal3f(normStore->verts[vi].x,normStore->verts[vi].y,normStore->verts[vi].z);
+                    } else if(vi%3==0&&vi+2<n){
+                        float ax=s.verts[vi+1].x-s.verts[vi].x,ay=s.verts[vi+1].y-s.verts[vi].y,az=s.verts[vi+1].z-s.verts[vi].z;
+                        float bx=s.verts[vi+2].x-s.verts[vi].x,by=s.verts[vi+2].y-s.verts[vi].y,bz=s.verts[vi+2].z-s.verts[vi].z;
+                        float nx2=ay*bz-az*by,ny2=az*bx-ax*bz,nz2=ax*by-ay*bx;
+                        float len=std::sqrt(nx2*nx2+ny2*ny2+nz2*nz2);
+                        if(len>0){nx2/=len;ny2/=len;nz2/=len;}
+                        glNormal3f(nx2,ny2,nz2);
+                    }
+                    if(hasTex) glTexCoord2f(s.verts[vi].u,s.verts[vi].v);
+                    glVertex3f(s.verts[vi].x,s.verts[vi].y,s.verts[vi].z);
+                }
+                glEnd();
+                if(hasTex){glDisable(GL_TEXTURE_2D);glBindTexture(GL_TEXTURE_2D,0);}
+            } else {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+            // Use stencil with evenodd rule -- draw each closed subpath separately
+            // so multiple subpaths (e.g. Michigan's two peninsulas) each fill correctly
+            glEnable(GL_STENCIL_TEST);
+            glClear(GL_STENCIL_BUFFER_BIT);
+            glStencilFunc(GL_ALWAYS,0,~0);
+            glStencilOp(GL_KEEP,GL_KEEP,GL_INVERT);
+            glColorMask(GL_FALSE,GL_FALSE,GL_FALSE,GL_FALSE);
+            glDisable(GL_CULL_FACE);
+            // Draw each subpath as its own triangle fan into stencil
+            // Uses subpathStarts recorded during path parsing (one entry per M command)
+            {
+                auto drawFan=[&](int from, int to){
+                    if(to-from<3) return;
+                    glBegin(GL_TRIANGLE_FAN);
+                    for(int vi=from;vi<to;vi++)
+                        glVertex3f(s.verts[vi].x,s.verts[vi].y,s.verts[vi].z);
+                    glVertex3f(s.verts[from].x,s.verts[from].y,s.verts[from].z); // close
+                    glEnd();
+                };
+                if(s.subpathStarts.size()<=1){
+                    // Single subpath
+                    drawFan(0,(int)s.verts.size());
+                } else {
+                    // Multiple subpaths (e.g. Michigan's two peninsulas)
+                    for(int si=0;si<(int)s.subpathStarts.size();si++){
+                        int from=s.subpathStarts[si];
+                        int to=(si+1<(int)s.subpathStarts.size())?s.subpathStarts[si+1]:(int)s.verts.size();
+                        drawFan(from,to);
+                    }
+                }
+            }
+            glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+            glStencilFunc(GL_NOTEQUAL,0,~0);
+            glStencilOp(GL_KEEP,GL_KEEP,GL_KEEP);
+            float minx=s.verts[0].x,maxx=minx,miny=s.verts[0].y,maxy=miny;
+            for(auto& v:s.verts){minx=std::min(minx,v.x);maxx=std::max(maxx,v.x);miny=std::min(miny,v.y);maxy=std::max(maxy,v.y);}
+            glBegin(GL_QUADS);
+            glVertex3f(minx,miny,0);glVertex3f(maxx,miny,0);
+            glVertex3f(maxx,maxy,0);glVertex3f(minx,maxy,0);
+            glEnd();
+            glDisable(GL_STENCIL_TEST);
+            glDisable(GL_BLEND);
+            } // end else (non-TRIANGLES path)
+        }
+        if(useStroke && s.kind!=TRIANGLES){
+            if(se) glColor4f(s.strokeR,s.strokeG,s.strokeB,s.strokeA);
+            else   applyStroke();
+            glLineWidth(se?s.strokeW:strokeW);
+            glBegin(s.closed?GL_LINE_LOOP:GL_LINE_STRIP);
+            for(auto& v:s.verts) glVertex3f(v.x,v.y,v.z);
+            glEnd();
+            if(!se) restoreLighting();
+        }
     }
     glPopMatrix();
 }
@@ -2719,9 +3752,57 @@ std::string selectFolder(const std::string& prompt){
 }
 
 PImage* requestImage(const std::string& path){
-    PImage* img=new PImage(1,1);
-    std::thread([img,path]{
-        std::cerr<<"requestImage: enable stb_image for: "<<path<<"\n";
+    // Create a placeholder: width=-1 means "still loading", width=0 means "failed"
+    // We use a heap PImage and fill it in from a background thread.
+    // The sketch checks img->width != 0 && img->width != -1 to detect completion.
+    PImage* img = new PImage();
+    img->width  = -1;  // sentinel: loading in progress
+    img->height = -1;
+    std::thread([img, path]{
+        // Resolve search paths same as loadImage
+        std::vector<std::string> tries = {
+            path,
+            "data/" + path,
+            "files/" + path,
+        };
+        std::string found;
+        for (auto& t : tries) {
+            FILE* f = fopen(t.c_str(), "rb");
+            if (f) { fclose(f); found = t; break; }
+        }
+        if (found.empty()) {
+            // Not found: mark as failed (width=0)
+            img->width  = 0;
+            img->height = 0;
+            std::cerr << "requestImage: file not found: " << path << "\n";
+            return;
+        }
+#ifdef PROCESSING_HAS_STB_IMAGE
+        int w=0, h=0, ch=0;
+        unsigned char* data = stbi_load(found.c_str(), &w, &h, &ch, 4);
+        if (!data || w<=0 || h<=0) {
+            img->width  = 0;
+            img->height = 0;
+            std::cerr << "requestImage: failed to decode: " << path << "\n";
+            return;
+        }
+        img->pixels.resize((size_t)w * h);
+        for (int i = 0; i < w*h; i++) {
+            unsigned char r=data[i*4+0], g=data[i*4+1],
+                          b=data[i*4+2], a=data[i*4+3];
+            img->pixels[i] = ((unsigned int)a<<24)|((unsigned int)r<<16)|
+                              ((unsigned int)g<<8)|(unsigned int)b;
+        }
+        stbi_image_free(data);
+        img->dirty  = true;
+        // Write width/height last so the sketch sees a consistent state
+        img->height = h;
+        img->width  = w;   // width != -1 signals "done"
+#else
+        img->width  = 0;
+        img->height = 0;
+        std::cerr << "requestImage: rebuild with -DPROCESSING_HAS_STB_IMAGE: " << path << "\n";
+#endif
     }).detach();
     return img;
 }

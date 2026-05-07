@@ -195,6 +195,9 @@ static int  curCol    = 0;
 static int  selLine   = -1;
 static int  selCol    = -1;
 static int  scrollTop = 0;
+static bool sbDragging = false;
+static float sbDragStartY = 0;
+static int   sbDragStartScroll = 0;
 
 // =============================================================================
 // TERMINAL TABS
@@ -783,6 +786,14 @@ static std::string javaToC(const std::string& line) {
     }
 
 
+    // Convert (double_expr) % int to (int)(double_expr) % int
+    // The % operator doesn't work on floats/doubles in C++
+    {
+        // Match: (expr) % varname where expr contains a dot (float result)
+        std::regex modFloat(R"(\(([^)]+\.[^)]*)\)\s*%\s*(\w+))");
+        out = std::regex_replace(out, modFloat, "(int)($1) % $2");
+    }
+
     // Rename Windows-reserved identifiers that conflict with WinAPI macros.
     // e.g. `float far = ...` fails because <windows.h> defines `far` as empty macro.
     {
@@ -809,6 +820,50 @@ static std::string javaToC(const std::string& line) {
         // Match: (optional whitespace) int (spaces) (identifier) (spaces) = (spaces) (color|lerpColor)(
         std::regex colorAssign(R"(\bint\s+(\w+)\s*=\s*(color|lerpColor)\s*\()");
         out = std::regex_replace(out, colorAssign, "color $1 = $2(");
+    }
+
+    // Rename variables that shadow Processing API functions.
+    // e.g. `float scale;` conflicts with scale(x,y) transform.
+    // Only rename when the name appears as a VARIABLE (after a type keyword).
+    // This renames the declaration AND all uses via whole-word replace.
+    {
+        static const std::vector<std::pair<std::string,std::string>> apiConflicts = {
+            {"scale","_scale"},{"fill","_fill"},{"stroke","_stroke"},
+            {"background","_background"},{"translate","_translate"},
+            {"rotate","_rotate"},{"map","_map"},{"dist","_dist"},{"noise","_noise"},
+        };
+        // Match: type keyword followed by the conflicting name as a variable
+        // (not followed by '(' which would make it a function call)
+        static const std::string typeKw =
+            R"((?:int|float|double|bool|char|long|unsigned|auto|color|PImage\*?|PVector)\s+)";
+        for (auto& [word, repl] : apiConflicts) {
+            // Check if this word appears as a variable declaration
+            std::regex declPat(typeKw + "(" + word + R"()(?!\s*\())");
+            if (std::regex_search(out, declPat)) {
+                // Rename all whole-word occurrences that are NOT followed by '('
+                // Strategy: rename ALL occurrences, then fix function calls back
+                std::string renamed;
+                size_t i = 0, wl = word.size();
+                while (i <= out.size()) {
+                    if (i + wl <= out.size() && out.substr(i,wl) == word) {
+                        bool prevOk = (i==0)||(!isalnum((unsigned char)out[i-1])&&out[i-1]!='_');
+                        bool nextOk = (i+wl>=out.size())||(!isalnum((unsigned char)out[i+wl])&&out[i+wl]!='_');
+                        if (prevOk && nextOk) {
+                            // Check if this is a function call (followed by '(' possibly with spaces)
+                            size_t j = i + wl;
+                            while (j < out.size() && out[j] == ' ') j++;
+                            bool isCall = (j < out.size() && out[j] == '(');
+                            if (!isCall) {
+                                renamed += repl; i += wl; continue;
+                            }
+                        }
+                    }
+                    if (i < out.size()) renamed += out[i];
+                    i++;
+                }
+                out = renamed;
+            }
+        }
     }
 
     // (color param name heuristic removed -- too many false positives)
@@ -1095,8 +1150,96 @@ static bool writeSketch() {
         f << "void draw() {}\n";
     } else {
         // Structured sketch -- paste as-is (already has setup/draw defined)
-        for (auto& l : code) {
-            std::string sl = sanitizeLine(l);
+        // Pre-pass 1: hoist class definitions to top (they may be used before defined).
+        // Pre-pass 2: collect top-level bare function calls into setup().
+        {
+            // Separate code into: class blocks, and everything else
+            std::vector<std::string> classLines;   // complete class definitions
+            std::vector<std::string> toInject;     // bare calls to inject into setup()
+            std::vector<std::string> otherLines;   // everything else
+
+            int depth = 0;
+            bool inClass = false;
+            std::vector<std::string> classBuf;
+
+            for (auto& rawl : code) {
+                std::string tr = rawl;
+                size_t p0 = tr.find_first_not_of(" \t");
+                if (p0 != std::string::npos) tr = tr.substr(p0);
+
+                // Detect class start at depth 0
+                if (depth == 0 && !inClass) {
+                    bool startsClass = (tr.rfind("class ", 0) == 0 || tr.rfind("struct ", 0) == 0);
+                    if (startsClass) {
+                        inClass = true;
+                        classBuf.clear();
+                    }
+                }
+
+                if (inClass) {
+                    classBuf.push_back(rawl);
+                    for (char c : rawl) { if(c=='{') depth++; else if(c=='}') depth--; }
+                    // Only end class when we've seen at least one { AND depth returns to 0
+                    if (depth == 0 && classBuf.size() > 1) {
+                        for (auto& cl : classBuf) classLines.push_back(cl);
+                        classBuf.clear();
+                        inClass = false;
+                    }
+                    continue;
+                }
+
+                for (char c : rawl) { if(c=='{') depth++; else if(c=='}') depth--; }
+
+                // At depth 0: check for bare function calls
+                if (depth == 0) {
+                    bool looksLikeCall = !tr.empty()
+                        && std::isalpha((unsigned char)tr[0])
+                        && tr.find('(') != std::string::npos
+                        && tr.find(';') != std::string::npos;
+                    bool hasTypeBefore = false;
+                    if (looksLikeCall) {
+                        size_t paren = tr.find('(');
+                        std::string before = tr.substr(0, paren);
+                        hasTypeBefore = before.find(' ') != std::string::npos;
+                    }
+                    bool isComment = tr.size()>1 && tr[0]=='/' && (tr[1]=='/'||tr[1]=='*');
+                    if (looksLikeCall && !hasTypeBefore && !isComment) {
+                        toInject.push_back(rawl);
+                        continue;
+                    }
+                }
+                otherLines.push_back(rawl);
+            }
+
+            // Output: classes first, then everything else
+            auto emitLine = [&](const std::string& l) {
+                std::string sl = sanitizeLine(l);
+                for (auto& cv : colorVars) {
+                    std::regex re("\\bint\\s+(" + cv + ")\\b(\\s*\\[\\d+\\])?");
+                    sl = std::regex_replace(sl, re, "color $1$2");
+                }
+                f << sl << "\n";
+            };
+
+            for (auto& l : classLines) emitLine(l);
+
+            bool injected = false;
+            for (auto& l : otherLines) {
+                emitLine(l);
+                if (!injected && !toInject.empty()) {
+                    std::string tr2 = sanitizeLine(l);
+                    size_t p2 = tr2.find_first_not_of(" \t");
+                    if (p2 != std::string::npos) tr2 = tr2.substr(p2);
+                    if (tr2 == "void setup() {") {
+                        for (auto& inj : toInject)
+                            f << "    " << sanitizeLine(inj) << "\n";
+                        injected = true;
+                    }
+                }
+            }
+        }
+        // (loop handled above)
+        if(false) for (auto& l : code) {            std::string sl = sanitizeLine(l);
             for (auto& cv : colorVars) {
                 // Replace `int varname` and `int varname[N]` with color equivalents
                 std::regex re("\\bint\\s+(" + cv + ")\\b(\\s*\\[\\d+\\])?");
@@ -1860,12 +2003,16 @@ static void drawEditor() {
         }
     }
 
-    // Vertical scrollbar
-    qFill(ex+ew-8, ey, 8, eh, 36, 36, 36);
+    // Vertical scrollbar (14px wide for easier interaction)
+    static const int SB = 14;
+    qFill(ex+ew-SB, ey, SB, eh, 40, 40, 40);
     if ((int)code.size() > vis) {
-        float sbH = std::max(14.0f, (float)vis / code.size() * eh);
+        float sbH = std::max(20.0f, (float)vis / code.size() * eh);
         float sbY = ey + (float)scrollTop / code.size() * eh;
-        qFill(ex+ew-8, sbY, 8, sbH, 80, 80, 80);
+        // Highlight on hover
+        bool sbHov = (mouseX >= ex+ew-SB && mouseX <= ex+ew && mouseY >= ey && mouseY <= ey+eh);
+        int  sbCol = sbHov ? 120 : 90;
+        qFill(ex+ew-SB, sbY, SB, sbH, sbCol, sbCol, sbCol);
     }
 }
 

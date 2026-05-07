@@ -341,26 +341,7 @@ public:
     void updatePixels() { dirty = true; }
 
     // Upload CPU pixels to the GPU texture
-    void uploadTexture() {
-        if (width <= 0 || height <= 0 || pixels.empty()) return;
-        if ((int)pixels.size() < width * height) return;
-        glFlush(); // flush pending GL ops before texture upload
-        std::vector<unsigned char> rgba((size_t)width * height * 4);
-        for (int i = 0; i < width*height; i++) {
-            unsigned int p = pixels[i];
-            rgba[i*4+0] = (p>>16)&0xFF; // R
-            rgba[i*4+1] = (p>>8) &0xFF; // G
-            rgba[i*4+2] =  p     &0xFF; // B
-            rgba[i*4+3] = (p>>24)&0xFF; // A
-        }
-        if (texID == 0) glGenTextures(1, &texID);
-        glBindTexture(GL_TEXTURE_2D, texID);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-        glBindTexture(GL_TEXTURE_2D, 0);
-        dirty = false;
-    }
+    void uploadTexture(); // defined in Processing.cpp
 
     void resize(int w, int h) { width=w; height=h; pixels.assign(w*h, 0xFF000000); dirty=true; }
 
@@ -406,7 +387,7 @@ public:
     void mask(const PImage* m) { if (m) mask(*m); }
 
     // Destructor frees GPU texture
-    ~PImage() { if (texID) glDeleteTextures(1, &texID); }
+    virtual ~PImage() { if (texID) glDeleteTextures(1, &texID); }
 
     // Non-copyable (owns GPU resource -- use PImage* for assignment)
     PImage(const PImage&)            = delete;
@@ -452,8 +433,46 @@ public:
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
-    void beginDraw() { glBindFramebuffer(GL_FRAMEBUFFER, fbo); active=true;  }
-    void endDraw()   { glBindFramebuffer(GL_FRAMEBUFFER, 0);   active=false; }
+    GLint savedViewport[4] = {};
+    void beginDraw() {
+        glGetIntegerv(GL_VIEWPORT, savedViewport); // save main viewport
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glViewport(0, 0, width, height);
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+        glOrtho(0, width, 0, height, -1, 1); // Y-up for FBO
+        glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+        glScalef(1, -1, 1);                  // flip Y so Processing y=0 is at top
+        glTranslatef(0, -(float)height, 0);  // shift up
+        active = true;
+    }
+    void endDraw() {
+        glMatrixMode(GL_PROJECTION); glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);  glPopMatrix();
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        active = false;
+        // Restore saved main canvas viewport and projection
+        extern int logicalW, logicalH;
+        glViewport(savedViewport[0],savedViewport[1],savedViewport[2],savedViewport[3]);
+        glMatrixMode(GL_PROJECTION);glLoadIdentity();
+        glOrtho(0,logicalW,logicalH,0,-1,1);
+        glMatrixMode(GL_MODELVIEW);glLoadIdentity();
+    }
+
+    // Drawing methods forwarded to Processing -- implemented after full decls
+    void background(float g); void background(float r, float g, float b); void background(float r, float g, float b, float a);
+    void fill(float g); void fill(float r, float g, float b); void fill(float r, float g, float b, float a);
+    void noFill(); void stroke(float g); void stroke(float r, float g, float b); void noStroke();
+    void strokeWeight(float w);
+    void ellipse(float x, float y, float w, float h);
+    void rect(float x, float y, float w, float h);
+    void line(float x1, float y1, float x2, float y2);
+    void point(float x, float y);
+    void triangle(float x1,float y1,float x2,float y2,float x3,float y3);
+    void text(const std::string& s, float x, float y);
+    void translate(float x, float y); void rotate(float a); void scale(float s);
+    void pushMatrix(); void popMatrix();
+    void beginShape(); void endShape(int mode=0); void vertex(float x, float y);
+    void clear();
 
     ~PGraphics() {
         if (fbo) glDeleteFramebuffers(1,  &fbo);
@@ -462,6 +481,20 @@ public:
 
     PGraphics(const PGraphics&)            = delete;
     PGraphics& operator=(const PGraphics&) = delete;
+    // Allow assignment from pointer (PGraphics pg; pg = createGraphics(w,h))
+    PGraphics& operator=(PGraphics* p) {
+        if(p && p!=this){
+            // Transfer ownership
+            if(fbo) glDeleteFramebuffers(1,&fbo);
+            if(rbo) glDeleteRenderbuffers(1,&rbo);
+            fbo=p->fbo; rbo=p->rbo; texID=p->texID;
+            width=p->width; height=p->height;
+            active=p->active;
+            p->fbo=0; p->rbo=0; p->texID=0;
+            delete p;
+        }
+        return *this;
+    }
 };
 
 // =============================================================================
@@ -764,9 +797,9 @@ inline bool isInfinite(float v) { return std::isinf(v);  }
 // RANDOM / NOISE
 // =============================================================================
 
-inline void  randomSeed(int s)                { std::srand(static_cast<unsigned>(s)); }
-inline float random(float lo, float hi)       { return lo + static_cast<float>(rand())/static_cast<float>(RAND_MAX)*(hi-lo); }
-inline float random(float hi)                 { return random(0.f, hi); }
+void  randomSeed(long s);
+float random(float lo, float hi);
+float random(float hi);
 float  randomGaussian();
 void   noiseSeed(int seed);
 void   noiseDetail(int octaves, float falloff=0.5f);
@@ -836,7 +869,10 @@ color makeColor(float gray, float alpha=255);
 
 // Pack raw 0-255 RGBA without colorMode (for internal use)
 inline color colorVal(int r, int g, int b, int a=255) {
-    return color((unsigned int)(((a&0xFF)<<24)|((r&0xFF)<<16)|((g&0xFF)<<8)|(b&0xFF)));
+    // Clamp to [0,255] -- don't wrap, which would cause dark artifacts
+    // when noise()*255 or other values slightly exceed 255
+    auto clamp8=[](int v){return v<0?0:v>255?255:v;};
+    return color((unsigned int)(((clamp8(a))<<24)|((clamp8(r))<<16)|((clamp8(g))<<8)|(clamp8(b))));
 }
 
 // Color component extractors
@@ -1015,6 +1051,8 @@ void hint(int which);
 void cursor();
 void cursor(int type);
 void noCursor();
+void captureMouse();   // lock cursor to window + raw input (for FPS games)
+void releaseMouse();   // unlock cursor
 
 // Convenience aliases that match Processing Java naming
 inline int  displayDensity()                { return pixelDensityValue; }
@@ -1060,16 +1098,20 @@ void clear();
 // FILL / STROKE
 // =============================================================================
 
-void fill(float gray, float a=255.f);
-void fill(float r, float g, float b, float a=255.f);
+void fill(float gray, float a);
+void fill(float gray);
+void fill(float r, float g, float b, float a);
+void fill(float r, float g, float b);
 void fill(color c);
 void fill(color c, float a);  // fill with color + override alpha
 inline void fill(color c, int a) { fill(c, (float)a); }
 void fill(const PColor& c);
 void noFill();
 
-void stroke(float gray, float a=255.f);
-void stroke(float r, float g, float b, float a=255.f);
+void stroke(float gray, float a);
+void stroke(float gray);
+void stroke(float r, float g, float b, float a);
+void stroke(float r, float g, float b);
 void stroke(color c);
 void stroke(const PColor& c);
 void noStroke();
@@ -1149,8 +1191,15 @@ template<typename A, typename B, typename C, typename D,
 inline void background(A r, B g, C b, D a)
     { background((float)r,(float)g,(float)b,(float)a); }
 
-template<typename A,
-         typename=std::enable_if_t<std::is_arithmetic_v<A>>>
+void tint(float gray, float a);
+void tint(float gray);
+void tint(float r, float g, float b, float a);
+void tint(float r, float g, float b);
+
+// Integer-only templates: these cast int args to float and call the float overloads.
+// Constrained to non-float types so float calls go directly to the float overload
+// above and don't recurse back into the template.
+template<typename A, typename=std::enable_if_t<std::is_arithmetic_v<A>>>
 inline void tint(A gray)
     { tint((float)gray); }
 
@@ -1181,6 +1230,7 @@ void ellipseMode(int mode);
 // =============================================================================
 
 void point(float x, float y);
+void point(float x, float y, float z);
 void line(float x1, float y1, float x2, float y2);
 void line(float x1, float y1, float z1, float x2, float y2, float z2);
 void ellipse(float cx, float cy, float w, float h);
@@ -1191,6 +1241,7 @@ void square(float x, float y, float s);
 void triangle(float x1, float y1, float x2, float y2, float x3, float y3);
 void quad(float x1, float y1, float x2, float y2, float x3, float y3, float x4, float y4);
 void arc(float cx, float cy, float w, float h, float start, float stop);
+void arc(float cx, float cy, float w, float h, float start, float stop, int mode);
 
 // Mixed-type templates are in the comprehensive block at end of namespace
 
@@ -1214,6 +1265,8 @@ void beginShape(int kind=-1);
 void endShape(int mode=0);
 void vertex(float x, float y);
 void vertex(float x, float y, float z);
+void vertex(float x, float y, float u, float v);
+void vertex(float x, float y, float z, float u, float v);
 void bezierVertex(float cx1, float cy1, float cx2, float cy2, float x, float y);
 void quadraticVertex(float cx, float cy, float x, float y);
 void curveVertex(float x, float y);
@@ -1317,13 +1370,11 @@ float textDescent();
 // =============================================================================
 
 PImage*    loadImage(const std::string& path);
+
+
 PImage* createImage(int w, int h, int mode=1);
 PGraphics* createGraphics(int w, int h);
-void       image(PImage& img, float x, float y);
-void       image(PImage& img, float x, float y, float w, float h);
 void       imageMode(int mode);
-void       tint(float gray, float a=255.f);
-void       tint(float r, float g, float b, float a=255.f);
 void       noTint();
 void       filter(int mode);
 void       filter(int mode, float param);
@@ -1618,13 +1669,51 @@ public:
 
     PShape() = default;
     explicit PShape(int k) : kind(k) {}
+    // Allow PShape bot = loadShape("file.svg") -- copies from pointer
+    PShape(const PShape* p) { if(p) *this = *p; }
+    PShape& operator=(const PShape* p) { if(p) *this = *p; return *this; }
 
     void beginShape(int k=-1)         { kind=k; verts.clear(); }
     void endShape(bool close=false)   { closed=close; }
     void vertex(float x,float y,float z=0,float u=0,float v=0) { verts.push_back({x,y,z,u,v}); }
     void addChild(const PShape& s)    { children.push_back(s); }
-    PShape* getChild(int i)           { return i<(int)children.size()?&children[i]:nullptr; }
-    int     getChildCount() const     { return (int)children.size(); }
+    std::string name; // id/name attribute from SVG
+    std::vector<int> subpathStarts; // subpath start indices for multi-part fills
+    std::vector<Vertex> anchorVerts; // raw anchor points (M/L/C endpoints only) for getVertex()
+
+    PShape* getChild(int i)  { return i<(int)children.size()?&children[i]:nullptr; }
+    PShape* getChild(const std::string& n) {
+        for(auto& c:children) if(c.name==n) return &c;
+        for(auto& c:children){ PShape* r=c.getChild(n); if(r) return r; }
+        // Return a static empty shape rather than nullptr to prevent crashes
+        static PShape _empty;
+        fprintf(stderr,"[PShape] getChild('%s') not found\n", n.c_str());
+        return &_empty;
+    }
+    PShape* getChild(const char* n) { return getChild(std::string(n)); }
+    int     getChildCount() const    { return (int)children.size(); }
+    PVector getVertex(int i) const   {
+        if(i<0||i>=(int)verts.size()) return PVector(0,0,0);
+        return PVector(verts[i].x, verts[i].y, verts[i].z);
+    }
+    void    setVertex(int i, float x, float y) {
+        if(i>=0&&i<(int)verts.size()){verts[i].x=x;verts[i].y=y;}
+    }
+    void    setVertex(int i, float x, float y, float z) {
+        if(i>=0&&i<(int)verts.size()){verts[i].x=x;verts[i].y=y;verts[i].z=z;}
+    }
+
+    // Bounding box (computed from verts + children)
+    float width  = 0;
+    float height = 0;
+    void computeBounds() {
+        float minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9;
+        for(auto& v:verts){minx=std::min(minx,v.x);maxx=std::max(maxx,v.x);miny=std::min(miny,v.y);maxy=std::max(maxy,v.y);}
+        for(auto& c:children){const_cast<PShape&>(c).computeBounds();minx=std::min(minx,c.verts.empty()?minx:minx);
+            if(!c.verts.empty()){for(auto& v:c.verts){minx=std::min(minx,v.x);maxx=std::max(maxx,v.x);miny=std::min(miny,v.y);maxy=std::max(maxy,v.y);}}}
+        width =(maxx>-1e8)?(maxx-minx):0;
+        height=(maxy>-1e8)?(maxy-miny):0;
+    }
     int     getVertexCount() const    { return (int)verts.size(); }
 
     void setFill(float r,float g,float b,float a=1)   { fillR=r;fillG=g;fillB=b;fillA=a;hasFill=true; }
@@ -1635,12 +1724,24 @@ public:
     void translate(float x,float y,float z=0) { for(auto& v:verts){ v.x+=x;v.y+=y;v.z+=z; } }
     void scale(float s)                        { for(auto& v:verts){ v.x*=s;v.y*=s;v.z*=s; } }
     void scale(float sx, float sy)             { for(auto& v:verts){ v.x*=sx;v.y*=sy; } }
+
+    // Style enable/disable -- controls whether shape uses its own fill/stroke
+    // or inherits from the current Processing fill()/stroke() state
+    bool styleEnabled = true;
+    void disableStyle() { styleEnabled = false; }
+    void enableStyle()  { styleEnabled = true;  }
+    GLuint texId = 0; // OpenGL texture ID for OBJ material textures
 };
 
 PShape  createShape(int kind=-1);
 PShape* loadShape(const std::string& path);
+PShape  loadShapeVal(const std::string& path); // returns by value for PShape bot = loadShape(...)
 void    shape(const PShape& s, float x=0, float y=0);
 void    shape(const PShape& s, float x, float y, float w, float h);
+inline void shape(const PShape* s, float x=0, float y=0)         { if(s) shape(*s,x,y); }
+inline void shape(const PShape* s, float x, float y, float w, float h) { if(s) shape(*s,x,y,w,h); }
+void image(PGraphics& pg, float x, float y);
+void image(PGraphics& pg, float x, float y, float w, float h);
 void    shapeMode(int mode);
 
 // =============================================================================
@@ -2015,20 +2116,56 @@ template<typename A,typename B,typename C,typename D,typename E,typename F,
 inline float dist(A x1,B y1,C z1,D x2,E y2,F z2){ return dist((float)x1,(float)y1,(float)z1,(float)x2,(float)y2,(float)z2); }
 
 // image() -- mixed types, value and pointer variants
-template<typename A,typename B,
-    typename=std::enable_if_t<std::is_arithmetic_v<A>&&std::is_arithmetic_v<B>>>
-inline void image(const PImage& img,A x,B y){ image(img,(float)x,(float)y); }
-template<typename A,typename B,typename C,typename D,
-    typename=std::enable_if_t<std::is_arithmetic_v<A>&&std::is_arithmetic_v<B>&&std::is_arithmetic_v<C>&&std::is_arithmetic_v<D>>>
-inline void image(const PImage& img,A x,B y,C w,D h2){ image(img,(float)x,(float)y,(float)w,(float)h2); }
-template<typename A,typename B,
-    typename=std::enable_if_t<std::is_arithmetic_v<A>&&std::is_arithmetic_v<B>>>
-inline void image(const PImage* img,A x,B y){
-    fprintf(stderr,"[image*] img=%p valid=%d\n",(void*)img,img?(int)img->width:0); fflush(stderr);
-    if(img) image(*img,(float)x,(float)y);
+// image() -- draw a PImage to screen
+// All user-facing overloads below; implementation in Processing.cpp
+void image(PImage* img, float x, float y);
+void image(PImage* img, float x, float y, float w, float h);
+inline void image(const PImage& img, float x, float y) {
+    // Check if this is actually a PGraphics (needs V-flip)
+    const PGraphics* pg2 = dynamic_cast<const PGraphics*>(&img);
+    if(pg2) image(const_cast<PGraphics&>(*pg2), x, y);
+    else image(const_cast<PImage*>(&img), x, y);
 }
-template<typename A,typename B,typename C,typename D,
-    typename=std::enable_if_t<std::is_arithmetic_v<A>&&std::is_arithmetic_v<B>&&std::is_arithmetic_v<C>&&std::is_arithmetic_v<D>>>
-inline void image(const PImage* img,A x,B y,C w,D h2){ if(img) image(*img,(float)x,(float)y,(float)w,(float)h2); }
+inline void image(const PImage& img, float x, float y, float w, float h) {
+    const PGraphics* pg2 = dynamic_cast<const PGraphics*>(&img);
+    if(pg2) image(const_cast<PGraphics&>(*pg2), x, y, w, h);
+    else image(const_cast<PImage*>(&img), x, y, w, h);
+}
+inline void image(const PImage* img, float x, float y)
+    { if(img) image(const_cast<PImage*>(img), x, y); }
+inline void image(const PImage* img, float x, float y, float w, float h)
+    { if(img) image(const_cast<PImage*>(img), x, y, w, h); }
 
+} // namespace Processing
+
+// =============================================================================
+// PGraphics method implementations (after all Processing function declarations)
+// =============================================================================
+namespace Processing {
+inline void PGraphics::background(float g)                          { ::Processing::background(g); }
+inline void PGraphics::background(float r, float g2, float b)       { ::Processing::background(r,g2,b,255); }
+inline void PGraphics::background(float r, float g2, float b, float a){ ::Processing::background(r,g2,b,a); }
+inline void PGraphics::fill(float g)                                { ::Processing::fill(g); }
+inline void PGraphics::fill(float r, float g2, float b)             { ::Processing::fill(r,g2,b); }
+inline void PGraphics::fill(float r, float g2, float b, float a)    { ::Processing::fill(r,g2,b,a); }
+inline void PGraphics::noFill()                                     { ::Processing::noFill(); }
+inline void PGraphics::stroke(float g)                              { ::Processing::stroke(g); }
+inline void PGraphics::stroke(float r, float g2, float b)           { ::Processing::stroke(r,g2,b); }
+inline void PGraphics::noStroke()                                   { ::Processing::noStroke(); }
+inline void PGraphics::strokeWeight(float w)                        { ::Processing::strokeWeight(w); }
+inline void PGraphics::ellipse(float x, float y, float w2, float h2){ ::Processing::ellipse(x,y,w2,h2); }
+inline void PGraphics::rect(float x, float y, float w2, float h2)   { ::Processing::rect(x,y,w2,h2); }
+inline void PGraphics::line(float x1, float y1, float x2, float y2) { ::Processing::line(x1,y1,x2,y2); }
+inline void PGraphics::point(float x, float y)                      { ::Processing::point(x,y); }
+inline void PGraphics::triangle(float x1,float y1,float x2,float y2,float x3,float y3){ ::Processing::triangle(x1,y1,x2,y2,x3,y3); }
+inline void PGraphics::text(const std::string& s, float x, float y) { ::Processing::text(s,x,y); }
+inline void PGraphics::translate(float x, float y)                  { ::Processing::translate(x,y); }
+inline void PGraphics::rotate(float a)                              { ::Processing::rotate(a); }
+inline void PGraphics::scale(float s)                               { ::Processing::scale(s); }
+inline void PGraphics::pushMatrix()                                 { ::Processing::pushMatrix(); }
+inline void PGraphics::popMatrix()                                  { ::Processing::popMatrix(); }
+inline void PGraphics::beginShape()                                 { ::Processing::beginShape(); }
+inline void PGraphics::endShape(int mode)                           { ::Processing::endShape(mode); }
+inline void PGraphics::vertex(float x, float y)                     { ::Processing::vertex(x,y); }
+inline void PGraphics::clear()                                      { ::Processing::clear(); }
 } // namespace Processing

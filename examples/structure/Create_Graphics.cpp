@@ -1,5 +1,3 @@
-#include "Processing.h"
-namespace Processing {
 /**
  * Create Graphics. 
  * 
@@ -37,8 +35,3 @@ void draw() {
     // Draw the offscreen buffer to the screen with image() 
     image(pg, 120, 60);
 }
-
-static void _sketchWire() {
-}
-static int _autoWire = []{ _wireCallbacksFn = _sketchWire; return 0; }();
-} // namespace Processing
