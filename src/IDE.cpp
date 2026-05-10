@@ -328,6 +328,9 @@ static bool showLibMgr    = false;
 static bool showExamples  = false;   // Examples browser overlay
 static int  exScroll      = 0;       // scroll position in examples list
 static int  exHover       = -1;      // which row the mouse is over
+static bool debuggerMode      = false; // Example Debugger: auto-cycle mode
+static int  debuggerIndex     = 0;     // current example index in debugger
+static bool debuggerAdvance   = false; // signal main thread to advance+compile
 
 struct ExampleEntry {
     std::string name;   // filename only (no folder prefix)
@@ -1353,6 +1356,11 @@ static void sketchReaderThread(int /*unused*/) {
       outLines.push_back("-- sketch exited --");
       outScroll = std::max(0, (int)outLines.size() - 14); }
     sketchRunning = false;
+    // Debugger mode: signal main thread to advance to next example
+    if (debuggerMode) {
+        debuggerIndex++;
+        debuggerAdvance = true; // main thread will pick this up
+    }
     // Delete the binary after the sketch exits (like Processing cleans up temp files)
     if (!runningBinPath.empty()) {
         plat_sleep_ms(50);           // brief pause so OS releases the file handle
@@ -1477,11 +1485,32 @@ static void doCompile(bool thenRun=false) {
     // then reuse it. Only Sketch_run.cpp changes each run.
     // On Windows this cuts compile time from ~8s to ~2s.
     static bool processingObjBuilt = false;
-    // Delete stale precompiled header if it exists -- it can cause GCC to use
-    // outdated declarations even after Processing.h is updated.
-    if (plat_file_exists("src/Processing.h.gch")) {
-        std::remove("src/Processing.h.gch");
+    // Precompiled header for Processing.h -- massively speeds up sketch compilation.
+    // Rebuild PCH only when Processing.h is newer than the .gch file.
+    static bool pchBuilt = false;
+    bool needPch = !pchBuilt || !plat_file_exists("src/Processing.h.gch");
+    if (!needPch && plat_file_exists("src/Processing.h") && plat_file_exists("src/Processing.h.gch")) {
+        struct stat hst, gst;
+        if (stat("src/Processing.h",&hst)==0 && stat("src/Processing.h.gch",&gst)==0)
+            if (hst.st_mtime > gst.st_mtime) { needPch = true; pchBuilt = false; }
     }
+    if (needPch) {
+        outLines.push_back("[build] Precompiling Processing.h...");
+        std::string pchCmd = "g++ -std=c++17 -x c++-header src/Processing.h -o src/Processing.h.gch " + buildFlags;
+#ifndef _WIN32
+        pchCmd += " 2>&1";
+#endif
+#ifdef _WIN32
+        auto _pch = plat_popen(pchCmd);
+        if (_pch.f) { char buf[256]; while(fgets(buf,sizeof(buf),_pch.f)){} plat_pclose(_pch); }
+#else
+        FILE* _pf = popen(pchCmd.c_str(),"r");
+        if (_pf) { char buf[256]; while(fgets(buf,sizeof(buf),_pf)){} pclose(_pf); }
+#endif
+        pchBuilt = plat_file_exists("src/Processing.h.gch");
+    }
+    // Use PCH for sketch compilation via -include Processing.h
+    // (GCC automatically uses the .gch if it's in the same directory)
 
     // Force rebuild if Processing.cpp is newer than Processing.o
     if (plat_file_exists("src/Processing.o") && plat_file_exists("src/Processing.cpp")) {
@@ -1516,6 +1545,9 @@ static void doCompile(bool thenRun=false) {
 
     // Build the compile command -- link prebuilt Processing.o with sketch
     std::string processingObj = processingObjBuilt ? "src/Processing.o" : "src/Processing.cpp";
+    // -include src/Processing.h makes GCC use src/Processing.h.gch automatically
+    std::string pchFlag = plat_file_exists("src/Processing.h.gch") ?
+        " -include src/Processing.h" : "";
     std::string cmd =
         "g++ -std=c++17"
         " " + processingObj +
@@ -1523,7 +1555,7 @@ static void doCompile(bool thenRun=false) {
         " src/Processing_defaults.cpp"
         " src/main.cpp"
         " -o \"" + outBin + "\"" +
-        " " + buildFlags +
+        " " + buildFlags + pchFlag +
 #ifndef _WIN32
         " 2>&1" +  // on Linux/Mac: merge stderr into stdout for popen()
 #endif
@@ -2196,6 +2228,14 @@ static void drawExamples() {
     qFill(xBx, xBy, xBw, xBh, xBH?180:80, xBH?40:32, xBH?44:38);
     iText("X", xBx+7, xBy+xBh*0.78f, 240, 200, 200, FST);
 
+    // Debug All button -- cycles through all examples automatically
+    float dBx = px+pw-200, dBy = py+8, dBw = 100, dBh = 22;
+    bool  dBH = mouseX>=dBx&&mouseX<=dBx+dBw&&mouseY>=dBy&&mouseY<=dBy+dBh;
+    bool  dOn = debuggerMode;
+    qFill(dBx, dBy, dBw, dBh, dOn?(dBH?60:50):( dBH?25:18), dOn?(dBH?140:120):(dBH?100:70), dOn?(dBH?255:220):(dBH?60:42));
+    qBorder(dBx, dBy, dBw, dBh, dOn?80:40, dOn?180:110, dOn?255:160);
+    iText(dOn?"■ Stop Debug":"▶ Debug All", dBx+6, dBy+dBh*0.78f, dOn?200:160, dOn?240:210, dOn?255:240, FST);
+
     // Column headers
     float hy = py + 44;
     qFill(px, hy, pw, 20, 32, 34, 48);
@@ -2693,6 +2733,19 @@ void draw() {
 
     if (fpShow)       drawFilePicker();
     if (showLibMgr)   drawLibMgr();
+    // Debugger mode: advance to next example after sketch exits
+    if (debuggerAdvance && !isBuilding.load() && !sketchRunning.load()) {
+        debuggerAdvance = false;
+        if (debuggerMode && !examplesList.empty()) {
+            std::vector<ExampleEntry> files;
+            for (auto& e : examplesList) files.push_back(e);
+            std::sort(files.begin(), files.end(), [](const ExampleEntry& a, const ExampleEntry& b){ return a.path < b.path; });
+            debuggerIndex = debuggerIndex % (int)files.size();
+            openFile(files[debuggerIndex].path);
+            pendingRun = true;
+            doCompile();
+        }
+    }
     if (showExamples)  drawExamples();
     if (showExportDlg) drawExportDlg();
     drawToolbar();   // chrome always on top
@@ -2745,6 +2798,25 @@ void mousePressed() {
         if (mouseX>=px+pw-34&&mouseX<=px+pw-10&&mouseY>=py+8&&mouseY<=py+30) { showExamples=false; return; }
         // Refresh
         if (mouseX>=px+pw-90&&mouseX<=px+pw-34&&mouseY>=py+8&&mouseY<=py+30) { refreshExamples(); return; }
+        // Debug All -- toggle debugger mode, start from first example
+        if (mouseX>=px+pw-200&&mouseX<=px+pw-100&&mouseY>=py+8&&mouseY<=py+30) {
+            debuggerMode = !debuggerMode;
+            if (debuggerMode && !examplesList.empty()) {
+                debuggerIndex = 0;
+                // Collect all file entries in order
+                std::vector<ExampleEntry> files;
+                for (auto& e : examplesList) files.push_back(e);
+                std::sort(files.begin(), files.end(), [](const ExampleEntry& a, const ExampleEntry& b){ return a.path < b.path; });
+                if (!files.empty()) {
+                    debuggerIndex = 0;
+                    openFile(files[0].path);
+                    showExamples = false;
+                    pendingRun = true;
+                    doCompile();
+                }
+            }
+            return;
+        }
         // Rows
         float ly=py+44+22, rowH=38.f;
         int   vis=(int)((ph-(ly-py)-8)/rowH);

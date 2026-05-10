@@ -1,4 +1,8 @@
 #pragma once
+#ifndef _WIN32
+#include <dirent.h>
+#endif
+#include <functional>
 // =============================================================================
 // Processing.h  --  ProcessingGL API
 // =============================================================================
@@ -435,14 +439,16 @@ public:
 
     GLint savedViewport[4] = {};
     void beginDraw() {
-        glGetIntegerv(GL_VIEWPORT, savedViewport); // save main viewport
+        glGetIntegerv(GL_VIEWPORT, savedViewport);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         glViewport(0, 0, width, height);
+        // Y-up (natural OpenGL/FBO) - content stored right-side-up in texture
         glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
-        glOrtho(0, width, 0, height, -1, 1); // Y-up for FBO
+        glOrtho(0, width, height, 0, -1, 1);
         glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
-        glScalef(1, -1, 1);                  // flip Y so Processing y=0 is at top
-        glTranslatef(0, -(float)height, 0);  // shift up
+        // FBO stores Y flipped vs screen - compensate so Processing Y-down coords work
+        glScalef(1.0f, -1.0f, 1.0f);
+        glTranslatef(0.0f, -(float)height, 0.0f);
         active = true;
     }
     void endDraw() {
@@ -1565,16 +1571,28 @@ public:
     std::vector<int> data;
     IntList() = default;
     IntList(std::initializer_list<int> l) : data(l) {}
+    // Java-style
     void append(int v)            { data.push_back(v); }
+    void add(int v)               { data.push_back(v); }
+    void add(int i, int v)        { data.insert(data.begin()+i,v); }
     void set(int i, int v)        { data[i]=v; }
     int  get(int i)         const { return data[i]; }
     int  size()             const { return (int)data.size(); }
+    bool isEmpty()          const { return data.empty(); }
     void sort()                   { std::sort(data.begin(),data.end()); }
     void reverse()                { std::reverse(data.begin(),data.end()); }
     bool hasValue(int v)    const { return std::find(data.begin(),data.end(),v)!=data.end(); }
+    bool contains(int v)    const { return hasValue(v); }
     void remove(int i)            { data.erase(data.begin()+i); }
     void clear()                  { data.clear(); }
+    void shuffle() {
+        for(int i=(int)data.size()-1;i>0;i--){
+            int j=rand()%(i+1); std::swap(data[i],data[j]);
+        }
+    }
     int& operator[](int i)        { return data[i]; }
+    auto begin() { return data.begin(); }
+    auto end()   { return data.end(); }
 };
 
 class FloatList {
@@ -1583,14 +1601,23 @@ public:
     FloatList() = default;
     FloatList(std::initializer_list<float> l) : data(l) {}
     void  append(float v)         { data.push_back(v); }
+    void  add(float v)            { data.push_back(v); }
     void  set(int i, float v)     { data[i]=v; }
     float get(int i)        const { return data[i]; }
     int   size()            const { return (int)data.size(); }
+    bool  isEmpty()         const { return data.empty(); }
     void  sort()                  { std::sort(data.begin(),data.end()); }
     void  reverse()               { std::reverse(data.begin(),data.end()); }
     void  remove(int i)           { data.erase(data.begin()+i); }
     void  clear()                 { data.clear(); }
+    void  shuffle() {
+        for(int i=(int)data.size()-1;i>0;i--){
+            int j=rand()%(i+1); std::swap(data[i],data[j]);
+        }
+    }
     float& operator[](int i)      { return data[i]; }
+    auto begin() { return data.begin(); }
+    auto end()   { return data.end(); }
 };
 
 class StringList {
@@ -1609,6 +1636,79 @@ public:
     void        clear()                         { data.clear(); }
     std::string& operator[](int i)              { return data[i]; }
 };
+
+// =============================================================================
+// PList<T> -- std::vector wrapper that works inside the Processing namespace
+// Use instead of std::vector<T> in sketches to avoid namespace conflicts.
+// All Java ArrayList methods supported: add, get, set, remove, size, clear,
+// contains, indexOf, sort, shuffle, isEmpty.
+// =============================================================================
+template<typename T>
+class PList {
+public:
+    ::std::vector<T> _data;
+
+    PList() {}
+    PList(::std::initializer_list<T> il) : _data(il) {}
+
+    // Core
+    void   add(const T& v)              { _data.push_back(v); }
+    void   add(int i, const T& v)       { _data.insert(_data.begin()+i, v); }
+    T&     get(int i)                   { return _data[i]; }
+    const T& get(int i) const           { return _data[i]; }
+    void   set(int i, const T& v)       { _data[i] = v; }
+    void   remove(int i)                { _data.erase(_data.begin()+i); }
+    bool   remove(const T& v)           { auto it=::std::find(_data.begin(),_data.end(),v); if(it==_data.end()) return false; _data.erase(it); return true; }
+    int    size()  const                { return (int)_data.size(); }
+    bool   isEmpty() const              { return _data.empty(); }
+    void   clear()                      { _data.clear(); }
+    bool   contains(const T& v) const   { return ::std::find(_data.begin(),_data.end(),v)!=_data.end(); }
+    int    indexOf(const T& v) const    { auto it=::std::find(_data.begin(),_data.end(),v); return it==_data.end()?-1:(int)(it-_data.begin()); }
+
+    // Sort / shuffle
+    void sort()    { ::std::sort(_data.begin(), _data.end()); }
+    void reverse() { ::std::reverse(_data.begin(), _data.end()); }
+    void shuffle() {
+        for(int i=size()-1;i>0;i--){
+            int j=(int)(::std::rand()%(i+1));
+            ::std::swap(_data[i],_data[j]);
+        }
+    }
+
+    // Operator[] for array-style access
+    T&       operator[](int i)       { return _data[i]; }
+    const T& operator[](int i) const { return _data[i]; }
+
+    // Range-for support
+    auto begin() { return _data.begin(); }
+    auto end()   { return _data.end(); }
+    auto begin() const { return _data.begin(); }
+    auto end()   const { return _data.end(); }
+
+    // Append all from another PList
+    void addAll(const PList<T>& other) { for(auto& v:other._data) _data.push_back(v); }
+};
+
+// Convenience aliases matching Java Processing names
+
+// PMap<K,V> -- thin std::unordered_map wrapper
+template<typename K, typename V>
+class PMap {
+public:
+    ::std::unordered_map<K,V> _data;
+    void  put(const K& k, const V& v)        { _data[k]=v; }
+    V&    get(const K& k)                     { return _data[k]; }
+    bool  containsKey(const K& k) const       { return _data.count(k)>0; }
+    void  remove(const K& k)                  { _data.erase(k); }
+    int   size() const                        { return (int)_data.size(); }
+    void  clear()                             { _data.clear(); }
+    auto  begin() { return _data.begin(); }
+    auto  end()   { return _data.end(); }
+};
+
+// =============================================================================
+// PGraphics method implementations (after all Processing function declarations)
+// =============================================================================
 
 class IntDict {
 public:
@@ -1749,6 +1849,41 @@ void    shapeMode(int mode);
 // =============================================================================
 
 struct PFont {
+    static std::vector<std::string> list() {
+        std::vector<std::string> fonts;
+        std::vector<std::string> dirs = {"data",".","/usr/share/fonts","/usr/local/share/fonts"};
+        #ifdef _WIN32
+        dirs.push_back("C:/Windows/Fonts");
+        #elif defined(__APPLE__)
+        dirs.push_back("/Library/Fonts"); dirs.push_back("/System/Library/Fonts");
+        #endif
+        if(getenv("HOME")){ dirs.push_back(std::string(getenv("HOME"))+"/.fonts"); }
+        std::function<void(const std::string&)> scan=[&](const std::string& dir){
+            #ifndef _WIN32
+            DIR* d=opendir(dir.c_str()); if(!d) return;
+            struct dirent* e;
+            while((e=readdir(d))!=nullptr){
+                std::string nm=e->d_name; if(nm=="."||nm=="..") continue;
+                std::string path=dir+"/"+nm;
+                if(e->d_type==DT_DIR){ scan(path); continue; }
+                if(nm.size()>4){std::string ext=nm.substr(nm.size()-4);
+                    if(ext==".ttf"||ext==".otf"||ext==".TTF"||ext==".OTF") fonts.push_back(nm);}
+            } closedir(d);
+            #else
+            WIN32_FIND_DATAA fd; HANDLE h2=FindFirstFileA((dir+"\\*").c_str(),&fd);
+            if(h2==INVALID_HANDLE_VALUE) return;
+            do { std::string nm=fd.cFileName; if(nm=="."||nm=="..") continue;
+                if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY){scan(dir+"\\"+nm);continue;}
+                if(nm.size()>4){std::string ext=nm.substr(nm.size()-4);
+                    if(ext==".ttf"||ext==".otf"||ext==".TTF"||ext==".OTF") fonts.push_back(nm);}
+            } while(FindNextFileA(h2,&fd)); FindClose(h2);
+            #endif
+        };
+        for(auto& d:dirs) scan(d);
+        std::sort(fonts.begin(),fonts.end());
+        fonts.erase(std::unique(fonts.begin(),fonts.end()),fonts.end());
+        return fonts;
+    }
     std::string name;
     float size = 12;
     bool  loaded = false;
@@ -1758,9 +1893,11 @@ struct PFont {
 };
 
 PFont loadFont(const std::string& filename);
-PFont createFont(const std::string& name, float size, bool smooth=true);
+PFont* createFont(const std::string& name, float size, bool smooth=true);
 void  textFont(const PFont& font);
 void  textFont(const PFont& font, float size);
+inline void textFont(const PFont* font) { if(font) textFont(*font); }
+inline void textFont(const PFont* font, float size) { if(font) textFont(*font,size); }
 
 // =============================================================================
 // TEXTURE
@@ -2049,6 +2186,11 @@ template<typename A,typename B,typename C,typename D,
 inline void text(const char* s,A x,B y,C w,D h2){ text(std::string(s),(float)x,(float)y,(float)w,(float)h2); }template<typename V,typename A,typename B,
     typename=std::enable_if_t<std::is_arithmetic_v<V>&&std::is_arithmetic_v<A>&&std::is_arithmetic_v<B>>>
 inline void text(V val,A x,B y){ text((float)val,(float)x,(float)y); }
+// char overload -- display as character not number
+template<typename A,typename B>
+inline void text(char c,A x,B y){ text(std::string(1,c),(float)x,(float)y); }
+template<typename A,typename B,typename C,typename D>
+inline void text(char c,A x,B y,C w,D h2){ text(std::string(1,c),(float)x,(float)y,(float)w,(float)h2); }
 
 // map() -- extremely common source of ambiguity
 template<typename V,typename A,typename B,typename C,typename D,
@@ -2138,9 +2280,7 @@ inline void image(const PImage* img, float x, float y, float w, float h)
 
 } // namespace Processing
 
-// =============================================================================
-// PGraphics method implementations (after all Processing function declarations)
-// =============================================================================
+
 namespace Processing {
 inline void PGraphics::background(float g)                          { ::Processing::background(g); }
 inline void PGraphics::background(float r, float g2, float b)       { ::Processing::background(r,g2,b,255); }
@@ -2169,3 +2309,15 @@ inline void PGraphics::endShape(int mode)                           { ::Processi
 inline void PGraphics::vertex(float x, float y)                     { ::Processing::vertex(x,y); }
 inline void PGraphics::clear()                                      { ::Processing::clear(); }
 } // namespace Processing
+
+
+inline void link(const std::string& url) {
+#ifdef _WIN32
+    ShellExecuteA(nullptr,"open",url.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+    system(("open "+url).c_str());
+#else
+    system(("xdg-open "+url+" &").c_str());
+#endif
+}
+inline void link(const char* url){link(std::string(url));}

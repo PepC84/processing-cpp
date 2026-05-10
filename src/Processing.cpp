@@ -1,6 +1,7 @@
 #include "Processing.h"
 #include <cstdlib>
 #include <cmath>
+#include <sys/stat.h>
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -348,12 +349,9 @@ color lerpColor(color c1,color c2,float t){
 
 static void applyFill() {
     glColor4f(fillR, fillG, fillB, fillA);
-    if(fillA < 0.999f){
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    } else {
-        glDisable(GL_BLEND);
-    }
+    // Always enable blend -- shapes with alpha need it, opaque shapes don't hurt
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 }
 
 // Temporarily suspend lighting so stroke lines/points render with their exact
@@ -364,12 +362,8 @@ static void applyStroke() {
         glDisable(GL_COLOR_MATERIAL);
     }
     glColor4f(strokeR, strokeG, strokeB, strokeA);
-    if(strokeA < 0.999f){
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    } else {
-        glDisable(GL_BLEND);
-    }
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 }
 
 // Restore lighting after a stroke draw call.
@@ -381,6 +375,40 @@ static void restoreLighting() {
         // Reapply fill colour so the next lit shape uses the right material
         glColor4f(fillR, fillG, fillB, fillA);
     }
+}
+
+static GLuint persistFBO=0, persistTex=0;
+static void initPersistFBO(){
+    if(persistFBO){glDeleteFramebuffers(1,&persistFBO);glDeleteTextures(1,&persistTex);persistFBO=0;}
+    glGenFramebuffers(1,&persistFBO);
+    glGenTextures(1,&persistTex);
+    glBindTexture(GL_TEXTURE_2D,persistTex);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,fbW,fbH,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+    glBindTexture(GL_TEXTURE_2D,0);
+    glBindFramebuffer(GL_FRAMEBUFFER,persistFBO);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,persistTex,0);
+    glBindFramebuffer(GL_FRAMEBUFFER,0);
+}
+
+// Copy current back buffer into persist FBO
+static void saveToPersist(){
+    if(!persistFBO) initPersistFBO();
+    // Blit back buffer -> persist FBO
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,persistFBO);
+    glBlitFramebuffer(0,0,fbW,fbH,0,0,fbW,fbH,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER,0);
+}
+
+// Restore persist FBO into back buffer
+static void restoreFromPersist(){
+    if(!persistFBO) return;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,persistFBO);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,0);
+    glBlitFramebuffer(0,0,fbW,fbH,0,0,fbW,fbH,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER,0);
 }
 
 static void _restoreMainCanvas(){
@@ -789,14 +817,59 @@ void point(float x, float y, float z) {
 void line(float x1, float y1, float x2, float y2) {
     if (!doStroke) return;
     applyStroke();
-    glLineWidth(strokeW);
-    if (!smoothing) {
-        // Snap to pixel centers for crisp lines
-        auto snap=[](float v){return std::floor(v)+0.5f;};
-        glBegin(GL_LINES); glVertex2f(snap(x1),snap(y1)); glVertex2f(snap(x2),snap(y2)); glEnd();
-    } else {
-        glBegin(GL_LINES); glVertex2f(x1, y1); glVertex2f(x2, y2); glEnd();
+    float w = strokeW;
+    if (w <= 1.0f) {
+        // Thin lines: use GL_LINES
+        glLineWidth(1.0f);
+        glBegin(GL_LINES); glVertex2f(x1,y1); glVertex2f(x2,y2); glEnd();
+        restoreLighting();
+        return;
     }
+    // Thick line: quad body + round caps using stencil to prevent double-blend
+    float dx = x2-x1, dy = y2-y1;
+    float len = std::sqrt(dx*dx+dy*dy);
+    if(len < 0.0001f){ restoreLighting(); return; }
+    float ux = dx/len, uy = dy/len;
+    float r = w*0.5f;
+    float px2 = -uy*r, py2 = ux*r; // perpendicular
+    int segs = std::max(16, (int)(r*4.0f));
+    // Use stencil to draw all geometry, then fill once -- prevents double-blend
+    glEnable(GL_STENCIL_TEST);
+    glClearStencil(0);
+    glClear(GL_STENCIL_BUFFER_BIT);
+    glStencilFunc(GL_ALWAYS, 1, 0xFF);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+    glColorMask(GL_FALSE,GL_FALSE,GL_FALSE,GL_FALSE);
+    // Draw body into stencil
+    glBegin(GL_QUADS);
+    glVertex2f(x1+px2,y1+py2); glVertex2f(x2+px2,y2+py2);
+    glVertex2f(x2-px2,y2-py2); glVertex2f(x1-px2,y1-py2);
+    glEnd();
+    // Draw end caps into stencil
+    for(int ep=0;ep<2;ep++){
+        float cx2=ep?x2:x1, cy2=ep?y2:y1;
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex2f(cx2,cy2);
+        for(int s=0;s<=segs;s++){
+            float a=s*TWO_PI/segs;
+            glVertex2f(cx2+std::cos(a)*r, cy2+std::sin(a)*r);
+        }
+        glEnd();
+    }
+    // Now draw color only where stencil=1
+    glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+    glStencilFunc(GL_EQUAL, 1, 0xFF);
+    glStencilOp(GL_KEEP,GL_KEEP,GL_KEEP);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    // Fill bounding box with stroke color
+    float minx=std::min(x1,x2)-r, maxx=std::max(x1,x2)+r;
+    float miny=std::min(y1,y2)-r, maxy=std::max(y1,y2)+r;
+    glBegin(GL_QUADS);
+    glVertex2f(minx,miny); glVertex2f(maxx,miny);
+    glVertex2f(maxx,maxy); glVertex2f(minx,maxy);
+    glEnd();
+    glDisable(GL_STENCIL_TEST);
     restoreLighting();
 }
 void line(float x1, float y1, float z1, float x2, float y2, float z2) {
@@ -880,7 +953,6 @@ varying vec3 vN;
 varying vec3 vP;
 void main(){
     // gl_NormalMatrix = inverse-transpose of modelview upper 3x3
-    // With glScalef(1,-1,1) baked in, normals are already correct in eye space
     vN = gl_NormalMatrix * gl_Normal;
     vP = vec3(gl_ModelViewMatrix * gl_Vertex);
     gl_Position = ftransform();
@@ -891,8 +963,8 @@ void main(){
 varying vec3 vN;
 varying vec3 vP;
 uniform int uNumLights;
-uniform float uLightConc[8];    // spotlight concentration (full range, not capped)
-uniform float uLightCutCos[8]; // cos(cutoff angle), -1 = not a spotlight
+uniform float uLightConc[8];
+uniform float uLightCutCos[8];
 void main(){
     vec3 N = normalize(vN);
     vec3 V = normalize(-vP);
@@ -900,32 +972,23 @@ void main(){
     for(int i=0;i<8;i++){
         if(i>=uNumLights) break;
         vec4 lp = gl_LightSource[i].position;
-        bool isDirectional = (lp.w < 0.5);
-        vec3 L = isDirectional ? normalize(lp.xyz) : normalize(lp.xyz - vP);
-
-        // Spotlight attenuation -- Java Processing formula:
-        // spotAtten = pow(dot(L, -spotDir), concentration) if inside cone, else 0
+        bool isDir = (lp.w < 0.5);
+        vec3 L = isDir ? normalize(lp.xyz) : normalize(lp.xyz - vP);
         float spotAtten = 1.0;
-        if(!isDirectional && uLightCutCos[i] > -0.5){
-            vec3 spotDir = normalize(gl_LightSource[i].spotDirection);
-            float spotCos = dot(L, -spotDir); // cos of angle between L and -spotDir
-            if(spotCos < uLightCutCos[i]){
-                spotAtten = 0.0;
-            } else {
-                // Java Processing: pow(spotCos, concentration)
-                spotAtten = pow(max(spotCos, 0.0), uLightConc[i]);
-            }
+        if(!isDir && uLightCutCos[i] > -0.5){
+            vec3 sd = normalize(gl_LightSource[i].spotDirection);
+            float sc = dot(L, -sd);
+            if(sc < uLightCutCos[i]) spotAtten = 0.0;
+            else spotAtten = pow(max(sc,0.0), uLightConc[i]);
         }
         if(spotAtten < 0.0001) continue;
-
         col += gl_Color.rgb * gl_LightSource[i].ambient.rgb;
         float d = max(dot(N, L), 0.0);
         col += gl_Color.rgb * gl_LightSource[i].diffuse.rgb * d * spotAtten;
-        // Blinn-Phong specular (matches Java Processing shader)
         vec3 H = normalize(L + V);
         float nh = max(dot(N, H), 0.0);
-        float s = pow(nh, gl_FrontMaterial.shininess + 1.0);
-        col += gl_FrontMaterial.specular.rgb * gl_LightSource[i].specular.rgb * s * spotAtten;
+        float sh = pow(nh, gl_FrontMaterial.shininess + 1.0);
+        col += gl_FrontMaterial.specular.rgb * gl_LightSource[i].specular.rgb * sh * spotAtten;
     }
     gl_FragColor = vec4(col, gl_Color.a);
 }
@@ -1347,14 +1410,13 @@ static void applyStandardModelview(); // forward declaration
 // Internal helper -- sets up the standard Processing Y-flipped perspective
 // camera. Called by camera() and perspective() so they stay in sync.
 static void applyDefaultCamera() {
-    // Use logical size (from size()) not tile size, so camera matches sketch coords.
     float eyeZ  = ((float)logicalH / 2.0f) / std::tan(PI * 60.0f / 360.0f);
     float near_ = eyeZ / 10.0f;
     float far_  = eyeZ * 10.0f;
     if(gWindow){int fw=logicalW,fh=logicalH;glfwGetFramebufferSize(gWindow,&fw,&fh);if(fw>0)fbW=fw;if(fh>0)fbH=fh;}
     glViewport(0, 0, fbW, fbH);
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    glScalef(1, -1, 1);  // Y-flip: must come BEFORE gluPerspective (Java Processing order)
+    glScalef(1,-1,1);
     _gluPerspective(60.0, (double)logicalW / logicalH, near_, far_);
     applyStandardModelview();
 }
@@ -1366,7 +1428,7 @@ void camera(float ex,float ey,float ez,float cx,float cy,float cz,float ux,float
     float eyeZ = ((float)logicalH/2.0f) / std::tan(PI*60.0f/360.0f);
     float near_ = eyeZ/10.0f, far_ = eyeZ*10.0f;
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    glScalef(1,-1,1);  // Y-flip before perspective (Java order)
+    glScalef(1,-1,1);
     _gluPerspective(60.0,(double)logicalW/logicalH,near_,far_);
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
     _gluLookAt(ex,ey,ez,cx,cy,cz,ux,uy,uz);
@@ -1382,7 +1444,7 @@ void perspective(){
 }
 void perspective(float fov, float aspect, float zNear, float zFar) {
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    glScalef(1,-1,1);  // Y-flip before perspective (Java order)
+    glScalef(1,-1,1);
     _gluPerspective(degrees(fov), aspect, zNear, zFar);
     applyStandardModelview();
 }
@@ -1390,9 +1452,6 @@ void perspective(float fov, float aspect, float zNear, float zFar) {
 // Processing modelview camera (eye at eyeZ looking at canvas centre,
 // Y-down screen coordinates) and enables depth test.
 static void applyStandardModelview() {
-    // Java Processing puts glScalef(1,-1,1) in the PROJECTION matrix.
-    // We replicate this: projection already has the flip (added in applyDefaultCamera),
-    // modelview is standard GL Y-up with gluLookAt.
     float eyeZ = ((float)logicalH / 2.0f) / std::tan(PI * 60.0f / 360.0f);
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
     _gluLookAt(logicalW/2.0, logicalH/2.0, eyeZ,
@@ -1568,7 +1627,9 @@ void directionalLight(float r, float g, float b, float nx, float ny, float nz) {
     // toward-light in eye space: negate direction, flip Y for our Y-down convention.
     glPushMatrix();
     glLoadIdentity();
-    GLfloat posE[] = { nx, -ny, nz, 0.0f }; // toward-light = -direction, Y flipped
+    // toward-light = negate direction. Y negated because Processing Y-down maps to eye Y-up
+    // (glScalef(1,-1,1) in projection flips screen Y, so world +Y = eye -Y)
+    GLfloat posE[] = { -nx, -ny, -nz, 0.0f };
     glLightfv(lt, GL_POSITION, posE);
     glPopMatrix();
 }
@@ -1792,7 +1853,7 @@ static float ttfStrWidth(const std::string& s) {
         if (ch < 32 || ch > 127) continue;
         int advance, lsb;
         stbtt_GetCodepointHMetrics(&g_ttf.info, ch, &advance, &lsb);
-        float sc = stbtt_ScaleForPixelHeight(&g_ttf.info, g_textSize);
+        float sc = stbtt_ScaleForMappingEmToPixels(&g_ttf.info, g_textSize);
         x += advance * sc;
     }
     return x;
@@ -1972,7 +2033,18 @@ void textSize(float size) {
 #endif
 }
 
-void textAlign(int alignX, int alignY) { g_textAlignX=alignX; g_textAlignY=alignY; }
+void textAlign(int alignX, int alignY) {
+    // Map standard constants (LEFT=37, RIGHT=39, CENTER=3) to align constants
+    auto mapAlign=[](int a)->int{
+        if(a==37||a==20) return LEFT_ALIGN;   // LEFT or LEFT_ALIGN
+        if(a==39||a==21) return RIGHT_ALIGN;  // RIGHT or RIGHT_ALIGN
+        if(a==3 ||a==25) return CENTER_ALIGN; // CENTER or CENTER_ALIGN
+        if(a==0)         return BASELINE;
+        return a;
+    };
+    g_textAlignX = mapAlign(alignX);
+    if(alignY >= 0) g_textAlignY = mapAlign(alignY);
+}
 void textLeading(float v) { g_textLeading = v; }
 void textMode(int) {}
 
@@ -1981,7 +2053,7 @@ float textWidth(const std::string& s) { return getLineWidth(s); }
 float textAscent() {
 #if PROCESSING_HAS_STB_TRUETYPE
     if (g_ttf.loaded) {
-        float sc = stbtt_ScaleForPixelHeight(&g_ttf.info, g_textSize);
+        float sc = stbtt_ScaleForMappingEmToPixels(&g_ttf.info, g_textSize);
         int asc; stbtt_GetFontVMetrics(&g_ttf.info, &asc, nullptr, nullptr);
         return asc * sc;
     }
@@ -1993,7 +2065,7 @@ float textAscent() {
 float textDescent() {
 #if PROCESSING_HAS_STB_TRUETYPE
     if (g_ttf.loaded) {
-        float sc = stbtt_ScaleForPixelHeight(&g_ttf.info, g_textSize);
+        float sc = stbtt_ScaleForMappingEmToPixels(&g_ttf.info, g_textSize);
         int desc; stbtt_GetFontVMetrics(&g_ttf.info, nullptr, &desc, nullptr);
         return std::fabs(desc * sc);
     }
@@ -2017,6 +2089,51 @@ PImage* createImage(int w,int h,int mode){
 }
 
 PImage* loadImage(const std::string& path){
+    // Handle URLs: download with curl/wget and validate image magic bytes
+    if (path.size()>7 && (path.substr(0,7)=="http://" || path.substr(0,8)=="https://")){
+#ifdef _WIN32
+        std::string tmp=std::string(getenv("TEMP")?getenv("TEMP"):"C:\\Temp")+"\\pg_img_";
+#else
+        std::string tmp="/tmp/pg_img_";
+#endif
+        size_t sl=path.rfind('/');
+        std::string bn=(sl!=std::string::npos)?path.substr(sl+1):"img.png";
+        { size_t q=bn.find('?'); if(q!=std::string::npos) bn=bn.substr(0,q); }
+        if(bn.empty()||bn.find('.')==std::string::npos) bn="img.png";
+        for(char& c:bn) if(c==':'||c=='*'||c=='<'||c=='>'||c=='|') c='_';
+        tmp+=bn;
+        auto isValidImg=[&]()->bool{
+            FILE* f2=fopen(tmp.c_str(),"rb"); if(!f2) return false;
+            fseek(f2,0,SEEK_END); long sz=ftell(f2); fseek(f2,0,SEEK_SET);
+            unsigned char h[4]={}; fread(h,1,4,f2); fclose(f2);
+            if(sz<100) return false;
+            return (h[0]==0x89&&h[1]=='P')|| // PNG
+                   (h[0]==0xFF&&h[1]==0xD8)|| // JPEG
+                   (h[0]=='G'&&h[1]=='I')||   // GIF
+                   (h[0]=='B'&&h[1]=='M')||   // BMP
+                   (h[0]=='R'&&h[1]=='I');    // WEBP
+        };
+        // Try curl
+#ifdef _WIN32
+        system(("curl -sL --max-time 15 -o \""+tmp+"\" \""+path+"\"").c_str());
+#else
+        system(("curl -sL --max-time 15 -o '"+tmp+"' '"+path+"'").c_str());
+#endif
+        if(!isValidImg()){
+            // Try wget as fallback
+#ifdef _WIN32
+            system(("wget -q -O \""+tmp+"\" \""+path+"\"").c_str());
+#else
+            system(("wget -q -O '"+tmp+"' '"+path+"'").c_str());
+#endif
+        }
+        if(isValidImg()){
+            PImage* r2=loadImage(tmp);
+            if(r2&&r2->width>0) return r2;
+        }
+        fprintf(stderr,"[loadImage] URL download failed: %s\n",path.c_str());
+        return nullptr;
+    }
     // Search paths: current dir, data/, files/, and sketch subdirs
     std::vector<std::string> tries = {
         path,
@@ -2114,10 +2231,12 @@ static void drawPGraphicsRect(PGraphics& pg, float x, float y, float w, float h)
     glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,pg.texID);
     glColor4f(1,1,1,1);
     glBegin(GL_QUADS);
-    glTexCoord2f(0,1);glVertex2f(x,y);     // v=1 at top = Processing y=0
-    glTexCoord2f(1,1);glVertex2f(x+w,y);
-    glTexCoord2f(1,0);glVertex2f(x+w,y+h); // v=0 at bottom = Processing y=h
-    glTexCoord2f(0,0);glVertex2f(x,y+h);
+    // Y-up FBO with Processing Y-down remap: Processing y=0 -> v=1 (top of texture)
+    // Display with V-flip: v=1 at screen top = Processing y=0
+    glTexCoord2f(0,0);glVertex2f(x,y);
+    glTexCoord2f(1,0);glVertex2f(x+w,y);
+    glTexCoord2f(1,1);glVertex2f(x+w,y+h);
+    glTexCoord2f(0,1);glVertex2f(x,y+h);
     glEnd();
     glBindTexture(GL_TEXTURE_2D,0); glDisable(GL_TEXTURE_2D); glDisable(GL_BLEND);
     glColor4f(1,1,1,1);
@@ -2597,6 +2716,7 @@ void run(){
         }
         ++frameCount; draw();
         flushPoints(); // flush any pending points before swap
+        saveToPersist(); // save back buffer before swap for next frame restore
         glfwSwapBuffers(gWindow);
     }
 
@@ -2607,12 +2727,15 @@ void run(){
     // Poll multiple times to flush it, then forcibly clear the close flag.
     for(int _flush=0; _flush<10; _flush++) glfwPollEvents();
     glfwSetWindowShouldClose(gWindow, GLFW_FALSE);
-    // Clear both buffers to the background color set during setup()
-    // so the front-to-back blit starts from the correct color.
-    for(int _b=0;_b<2;_b++){
-        glClearColor(bgR,bgG,bgB,bgA);
-        glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
-        glfwSwapBuffers(gWindow);
+    // For looping sketches: clear both buffers to bgColor so the
+    // front-to-back blit starts from the correct background color.
+    // For static sketches (noLoop): don't clear - preserve what setup() drew.
+    if(looping){
+        for(int _b=0;_b<2;_b++){
+            glClearColor(bgR,bgG,bgB,bgA);
+            glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+            glfwSwapBuffers(gWindow);
+        }
     }
     while(!glfwWindowShouldClose(gWindow)){
         pmouseX=mouseX;pmouseY=mouseY;
@@ -2648,13 +2771,10 @@ void run(){
                 glMatrixMode(GL_MODELVIEW); glLoadIdentity();
                 glDisable(GL_DEPTH_TEST);
                 glDisable(GL_LIGHTING);
-                // Copy front buffer to back buffer so accumulating sketches
-                // (no background() each frame) work correctly with double buffering.
-                // Sketches that call background() will just overwrite this.
-                glReadBuffer(GL_FRONT);
-                glDrawBuffer(GL_BACK);
-                glBlitFramebuffer(0,0,fbW,fbH, 0,0,fbW,fbH,
-                                  GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                // Restore previous frame content from persist FBO.
+                // Sketches that call background() will overwrite this.
+                // Sketches that don't (like Keyboard) preserve their drawn content.
+                restoreFromPersist();
                 glClear(GL_DEPTH_BUFFER_BIT);
             }
 
@@ -3615,7 +3735,8 @@ PFont loadFont(const std::string& filename) {
 }
 
 // createFont -- creates font from a name/path and size
-PFont createFont(const std::string& name, float size, bool /*smooth*/) {
+static std::vector<PFont> _fontPool;
+PFont* createFont(const std::string& name, float size, bool /*smooth*/) {
     PFont f(name, size);
     // Try as file path first, then common system paths
     // Strip extension from name if already present, to avoid double extensions
@@ -3691,7 +3812,7 @@ PFont createFont(const std::string& name, float size, bool /*smooth*/) {
         std::cerr << "[font] Could not find font: " << name << "\n";
         std::cerr << "[font] Put the .ttf file in your sketch's data/ folder\n";
     }
-    return f;
+    _fontPool.push_back(std::move(f)); return &_fontPool.back();
 }
 
 // textFont -- switch to a previously loaded font
