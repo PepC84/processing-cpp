@@ -1,69 +1,47 @@
 #include "Processing.h"
 namespace Processing {
-void update(float mx, float my);
-void display();
-class Eye {
-
-  float x, y;
-  float size;
-  float angle = 0.0;
-
-  Eye(float tx, float ty, float ts) {
-    x = tx;
-    y = ty;
-    size = ts;
-  }
-
-  void update(float mx, float my) {
-    angle = atan2(my - y, mx - x);
-  }
-  
-  void display() {
-    pushMatrix();
-    translate(x, y);
-
-    fill(255);
-    ellipse(0, 0, size, size);
-
-    rotate(angle);
-
-    fill(153, 204, 0);
-    ellipse(size / 4, 0, size / 2, size / 2);
-
-    popMatrix();
-  }
-}
 /**
- * Arctangent. 
- * 
- * Move the mouse to change the direction of the eyes. 
- * The atan2() function computes the angle from each eye 
- * to the cursor. 
+ * Processing++ Logo
+ * White background, gold plus with shadow and glow particles.
  */
 
-Eye e1, e2, e3;
-
 void setup() {
-  size(640, 360, P3D);
-  noStroke();
-
-  e1 = new Eye(250, 16, 120);
-  e2 = new Eye(164, 185, 80);  
-  e3 = new Eye(420, 230, 220);
+    size(1200, 700);
+    smooth();
+    noLoop();
 }
 
 void draw() {
-  background(102);
-  
-  e1.update(mouseX, mouseY);
-  e2.update(mouseX, mouseY);
-  e3.update(mouseX, mouseY);
+    background(255);
+    translate(width/2, height/2);
 
-  e1.display();
-  e2.display();
-  e3.display();
+    // Soft shadow plus
+    noStroke();
+    fill(120, 90, 40, 90);
+    rect(-25 + 35, -120 + 35, 50, 240, 16);
+    rect(-120 + 35, -25 + 35, 240, 50, 16);
+
+    // Main plus
+    fill(210, 170, 70);
+    rect(-25, -120, 50, 240, 16);
+    rect(-120, -25, 240, 50, 16);
+
+    // Small glow rings
+    noFill();
+    strokeWeight(2);
+    for (int i = 0; i < 20; i++) {
+        stroke(230, 190, 90, 8);
+        rect(-120 - i*2, -120 - i*2, 240 + i*4, 240 + i*4, 20);
+    }
+
+    // Floating particles
+    noStroke();
+    fill(220, 180, 80, 100);
+    ellipse(-170, -100, 10, 10);
+    ellipse( 140, -130, 14, 14);
+    ellipse( 180,   90,  8,  8);
+    ellipse(-150,  140, 12, 12);
 }
-
 
 static void _sketchWire() {
 }

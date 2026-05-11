@@ -908,7 +908,7 @@ void rect(float x,float y,float w,float h){
 void rect(float x,float y,float w,float h,float r){
     resolveRect(x,y,w,h);r=min(r,min(w,h)*0.5f);const int sg=8;
     auto corner=[&](float cx,float cy,float sa,float ea){for(int i=0;i<=sg;i++){float a=sa+(ea-sa)*i/sg;glVertex2f(cx+r*std::cos(a),cy+r*std::sin(a));}};
-    if(doFill){applyFill();glBegin(GL_TRIANGLE_FAN);glVertex2f(x+w/2,y+h/2);corner(x+r,y+r,PI,PI+HALF_PI);corner(x+w-r,y+r,PI+HALF_PI,TWO_PI);corner(x+w-r,y+h-r,0,HALF_PI);corner(x+r,y+h-r,HALF_PI,PI);glEnd();}
+    if(doFill){applyFill();glBegin(GL_TRIANGLE_FAN);glVertex2f(x+w/2,y+h/2);corner(x+r,y+r,PI,PI+HALF_PI);corner(x+w-r,y+r,PI+HALF_PI,TWO_PI);corner(x+w-r,y+h-r,0,HALF_PI);corner(x+r,y+h-r,HALF_PI,PI);glVertex2f(x+r+r*std::cos(PI),y+r+r*std::sin(PI));glEnd();}
     if(doStroke){applyStroke();glLineWidth(strokeW);glBegin(GL_LINE_LOOP);corner(x+r,y+r,PI,PI+HALF_PI);corner(x+w-r,y+r,PI+HALF_PI,TWO_PI);corner(x+w-r,y+h-r,0,HALF_PI);corner(x+r,y+h-r,HALF_PI,PI);glEnd();}
 }
 void square(float x,float y,float s){rect(x,y,s,s);}
@@ -2557,7 +2557,7 @@ void enableDebugConsole() {
         freopen_s(&f, "CONOUT$", "w", stdout);
         freopen_s(&f, "CONOUT$", "w", stderr);
         freopen_s(&f, "CONIN$",  "r", stdin);
-        fprintf(stderr, "[debug] ProcessingGL debug console enabled\n");
+        fprintf(stderr, "[debug] processing-cpp debug console enabled\n");
     }
 #endif
 }
@@ -2571,7 +2571,7 @@ void run(){
     if(!glfwInit()){
         fprintf(stderr, "[ERR] glfwInit() failed. Make sure libglfw3.dll is next to ide.exe\n");
 #ifdef _WIN32
-        MessageBoxA(NULL, "glfwInit() failed.\nMake sure libglfw3.dll and glew32.dll are next to ide.exe", "ProcessingGL Error", MB_OK|MB_ICONERROR);
+        MessageBoxA(NULL, "glfwInit() failed.\nMake sure libglfw3.dll and glew32.dll are next to ide.exe", "processing-cpp Error", MB_OK|MB_ICONERROR);
 #endif
         return;
     }
@@ -2594,10 +2594,10 @@ void run(){
     glfwWindowHint(GLFW_RESIZABLE,isResizable?GLFW_TRUE:GLFW_FALSE);
     glfwWindowHint(GLFW_SAMPLES,4); // 4x MSAA for crisp P3D rendering; 2D noSmooth() disables at runtime
     glfwWindowHint(GLFW_STENCIL_BITS,8);  // needed for concave shape fill
-    gWindow=glfwCreateWindow(winWidth,winHeight,"ProcessingGL",nullptr,nullptr);
+    gWindow=glfwCreateWindow(winWidth,winHeight,"processing-cpp",nullptr,nullptr);
     if(!gWindow){
 #ifdef _WIN32
-        MessageBoxA(NULL, "Window creation failed.\nCheck that your GPU supports OpenGL 2.0+", "ProcessingGL Error", MB_OK|MB_ICONERROR);
+        MessageBoxA(NULL, "Window creation failed.\nCheck that your GPU supports OpenGL 2.0+", "processing-cpp Error", MB_OK|MB_ICONERROR);
 #else
         fprintf(stderr, "[ERR] Window creation failed. Check OpenGL 2.0+ support.\n");
 #endif
@@ -2608,7 +2608,7 @@ void run(){
     if(glewErr != GLEW_OK){
 #ifdef _WIN32
         char msg[256]; snprintf(msg,sizeof(msg),"glewInit() failed: %s", glewGetErrorString(glewErr));
-        MessageBoxA(NULL, msg, "ProcessingGL Error", MB_OK|MB_ICONERROR);
+        MessageBoxA(NULL, msg, "processing-cpp Error", MB_OK|MB_ICONERROR);
 #else
         fprintf(stderr, "[ERR] glewInit() failed: %s\n", glewGetErrorString(glewErr));
 #endif

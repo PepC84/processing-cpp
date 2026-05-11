@@ -1,5 +1,5 @@
 // =============================================================================
-// IDE.cpp  --  ProcessingGL IDE
+// IDE.cpp  --  processing-cpp IDE
 // A Processing-style creative coding IDE built with the Processing.h API.
 // =============================================================================
 
@@ -673,7 +673,7 @@ static void doSaveAs(const std::string& def = "") {
         if (path.size() < 4 || path.substr(path.size()-4) != ".cpp")
             path += ".cpp";
         saveFile(path);
-        windowTitle("ProcessingGL IDE -- " + path);
+        windowTitle("processing-cpp IDE -- " + path);
     }
     // If dialog returns empty the user cancelled -- do nothing
 }
@@ -684,7 +684,7 @@ static void doSave() {
         doSaveAs();
     } else {
         saveFile(currentFile);
-        windowTitle("ProcessingGL IDE -- " + currentFile);
+        windowTitle("processing-cpp IDE -- " + currentFile);
     }
 }
 
@@ -999,6 +999,12 @@ static bool writeSketch() {
 
     f << "#include \"Processing.h\"\n";
     f << "namespace Processing {\n";
+    f << "using ::std::vector; using ::std::string; using ::std::map;\n";
+    f << "using ::std::sort; using ::std::shuffle; using ::std::random_device;\n";
+    f << "using ::std::mt19937; using ::std::uniform_int_distribution;\n";
+    f << "using ::std::pair; using ::std::make_pair; using ::std::set;\n";
+    f << "using ::std::deque; using ::std::stack; using ::std::queue;\n";
+    f << "using ::std::unordered_map; using ::std::to_string;\n";
 
     // Pre-scan: find variable names assigned color()/lerpColor() to fix their type.
     // Also propagates: if drawBand(a,b,...) is called where a,b are colorVars,
@@ -2636,7 +2642,7 @@ void setup() {
     size(1080, 740);
     windowResizable(true);
     frameRate(60);
-    windowTitle("ProcessingGL IDE");
+    windowTitle("processing-cpp IDE");
 
     // Load window icon
     {
@@ -2654,7 +2660,7 @@ void setup() {
     checkInstalled();
     // Tree is populated when user clicks "Open" -- not on startup
     refreshExamples();  // scan examples/ on startup
-    outLines.push_back("ProcessingGL ready.");
+    outLines.push_back("processing-cpp ready.");
     outLines.push_back("Ctrl+B build | Ctrl+R run | Ctrl+. stop | Ctrl+Shift+M serial | Ctrl+Shift+L libs");
 
 
